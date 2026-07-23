@@ -1,0 +1,17 @@
+{
+  "system": false,
+  "audit": true,
+  "fields": [
+    {"id": "AA01", "name": "file_id", "type": "STRING", "length": 32, "required": true, "unique": true},
+    {"id": "AA02", "name": "storage", "type": "SELECT", "required": true, "default": "local", "options": ["local", "s3"]},
+    {"id": "AA03", "name": "storage_key", "type": "STRING", "length": 255, "required": true, "unique": true},
+    {"id": "AA04", "name": "original_filename", "type": "STRING", "length": 255, "required": true},
+    {"id": "AA05", "name": "content_type", "type": "STRING", "length": 127, "required": true},
+    {"id": "AA06", "name": "size_bytes", "type": "INT", "required": true},
+    {"id": "AA07", "name": "checksum", "type": "STRING", "length": 64, "required": true},
+    {"id": "AA08", "name": "private", "type": "BOOLEAN", "required": true, "default": true},
+    {"id": "AA09", "name": "status", "type": "SELECT", "required": true, "default": "pending", "options": ["pending", "clean", "infected", "skipped", "deleted"]},
+    {"id": "AA10", "name": "deleted_at", "type": "DATETIME"}
+  ],
+  "index": [{"key": "idx_filerfile_checksum", "fields": ["checksum"]}, {"key": "idx_filerfile_status", "fields": ["status"]}]
+}
