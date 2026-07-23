@@ -1,0 +1,6 @@
+{
+  "fields": [
+    {"id": "AB01", "name": "path", "type": "STRING", "length": 255, "required": true, "default": "ungrouped"}
+  ],
+  "index": [{"key": "idx_filerfile_path", "fields": ["path"]}]
+}

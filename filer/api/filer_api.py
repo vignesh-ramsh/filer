@@ -56,7 +56,9 @@ def _as_bool(value: bool | str, *, default: bool) -> bool:
 
 
 @arc.relay.whitelist(methods=["POST"], roles=["*"], path="/files/upload", max_body_bytes=_MAX_REQUEST_BODY_BYTES)
-async def file_upload(request, storage: str | None = None, private: bool | str = True, identity=None) -> dict:
+async def file_upload(
+    request, storage: str | None = None, private: bool | str = True, path: str | None = None, identity=None
+) -> dict:
     identity = _require_identity(identity)
     form = request.form()
     upload = form.files.get("file")
@@ -68,9 +70,10 @@ async def file_upload(request, storage: str | None = None, private: bool | str =
         content_type=upload.content_type,
         storage=storage,
         private=_as_bool(private, default=True),
+        path=path,
         by=identity.email,
     )
-    return {"file_id": row["file_id"], "status": row["status"], "private": row["private"]}
+    return {"file_id": row["file_id"], "status": row["status"], "private": row["private"], "path": row["path"]}
 
 
 @arc.relay.whitelist(methods=["GET"], roles=["Guest"], path="/files/{file_id}")

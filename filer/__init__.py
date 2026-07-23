@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import secrets
 import time
 from dataclasses import dataclass
@@ -104,6 +105,38 @@ _INLINE_ALLOWLIST = frozenset({"image/png", "image/jpeg", "image/gif", "image/we
 _INHERITABLE_STATUSES = frozenset({"clean", "infected"})
 
 _FILE_FIELDS: dict[str, dict[str, str]] = {}  # table -> {field_name: "FILE"|"MULTIFILE"}
+
+# upload()'s optional `path` — a caller-chosen organizational folder, never
+# the filename (storage_key's own server-generated component still owns
+# collision/traversal safety, below). "/"-separated segments only.
+_UNGROUPED_PATH = "ungrouped"
+_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_MAX_PATH_DEPTH = 4
+
+
+def _normalize_path(path: str | None) -> str:
+    """Empty/omitted -> the shared 'ungrouped' bucket (same for public and
+    private, since visibility is already a separate prefix, below) — never
+    a silent default file lands at the storage root. Anything else must be
+    a clean, bounded "/"-separated path: each segment letters/digits/`_`/
+    `-` only (so a literal `.`/`..` segment is already impossible, not
+    merely blocked by a second check), no empty segments (rules out a
+    leading/trailing/doubled "/"), capped depth. A bad path is a clean,
+    named 400 here — LocalProvider's own containment check (providers.py)
+    stays as a second, independent backstop, not the only guard."""
+    if not path or not path.strip("/"):
+        return _UNGROUPED_PATH
+    segments = path.strip("/").split("/")
+    if len(segments) > _MAX_PATH_DEPTH:
+        arc.relay.throw(f"path may be at most {_MAX_PATH_DEPTH} levels deep", code="invalid_path")
+    for segment in segments:
+        if not _PATH_SEGMENT_RE.match(segment):
+            arc.relay.throw(
+                f"path segment {segment!r} is invalid — only letters, digits, '_', and '-' are allowed "
+                f"per segment, separated by '/'",
+                code="invalid_path",
+            )
+    return "/".join(segments)
 
 
 def utcnow() -> datetime:
@@ -202,6 +235,7 @@ class FilerProvider:
         content_type: str,
         storage: str | None = None,
         private: bool = True,
+        path: str | None = None,
         by: str | None = None,
     ) -> dict:
         from filer.providers import PROVIDERS
@@ -217,11 +251,12 @@ class FilerProvider:
         if max_bytes is not None and len(content) > max_bytes:
             arc.relay.throw(f"file exceeds the {max_bytes}-byte upload limit", code="file_too_large")
 
+        normalized_path = _normalize_path(path)
         checksum = hashlib.sha256(content).hexdigest()
         visibility_dir = "private" if private else "public"
         file_id = f"{'pri' if private else 'pub'}_{secrets.token_urlsafe(16)}"
         ext = _EXTENSION_FOR.get(content_type, ".bin")
-        storage_key = f"{visibility_dir}/{file_id}{ext}"
+        storage_key = f"{visibility_dir}/{normalized_path}/{file_id}{ext}"
 
         provider = PROVIDERS[storage]
         status, linked = "pending", False
@@ -248,6 +283,7 @@ class FilerProvider:
                 "size_bytes": len(content),
                 "checksum": checksum,
                 "private": private,
+                "path": normalized_path,
                 "status": status,
             },
             by=by,
