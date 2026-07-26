@@ -25,7 +25,11 @@ async def purge_deleted_files() -> None:
     from filer.providers import PROVIDERS
 
     cutoff = utcnow() - timedelta(days=arc.filer.purge_after_days())
-    rows = await arc.relay.list("filerfile", filters={"status": "deleted", "deleted_at": {"lte": cutoff}})
+    # Deliberately unbounded — every eligible row must actually be purged,
+    # not just the first DEFAULT_LIST_LIMIT of them each run.
+    rows = await arc.relay.list(
+        "filerfile", filters={"status": "deleted", "deleted_at": {"lte": cutoff}}, limit=None
+    )
     for row in rows:
         await PROVIDERS[row["storage"]].delete(row["storage_key"])
         await arc.relay.sql('DELETE FROM "filerfile" WHERE id = $1', row["id"])

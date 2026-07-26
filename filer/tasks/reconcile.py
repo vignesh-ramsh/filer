@@ -16,15 +16,23 @@ from filer import _FILE_FIELDS, _collect, utcnow
 
 @arc.relay.task(queue="default", cron="0 3 * * *")
 async def reconcile_orphaned_files() -> None:
+    # Deliberately unbounded (limit=None) both places below — this task's
+    # whole job IS a full scan (see module docstring); silently stopping
+    # at DEFAULT_LIST_LIMIT would let real orphaned files go undetected.
     referenced: set[str] = set()
     for table, fields in _FILE_FIELDS.items():
-        rows = await arc.relay.list(table, fields=list(fields.keys()))
+        rows = await arc.relay.list(table, fields=list(fields.keys()), limit=None)
         for row in rows:
             _collect(row, fields, referenced)
 
     candidates = await arc.relay.list(
-        "filerfile", filters={"status": {"in": ["clean", "pending", "skipped"]}}, fields=["id", "file_id"]
+        "filerfile",
+        filters={"status": {"in": ["clean", "pending", "skipped"]}},
+        fields=["id", "file_id"],
+        limit=None,
     )
     for row in candidates:
         if row["file_id"] not in referenced:
-            await arc.relay.save("filerfile", {"id": row["id"], "status": "deleted", "deleted_at": utcnow()})
+            await arc.relay.save(
+                "filerfile", {"id": row["id"], "status": "deleted", "deleted_at": utcnow()}
+            )

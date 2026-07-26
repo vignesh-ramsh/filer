@@ -69,7 +69,9 @@ DEFAULT_STORAGE = "local"
 DEFAULT_CLAMAV_SOCKET = "/var/run/clamav/clamd.ctl"
 DEFAULT_PURGE_AFTER_DAYS = 30
 DEFAULT_LINK_TTL_SECONDS = 300
-DEFAULT_MAX_REQUEST_BODY_BYTES = 60 * 1024 * 1024  # 60MB — generous headroom over the 30-50MB use case named for it
+DEFAULT_MAX_REQUEST_BODY_BYTES = (
+    60 * 1024 * 1024
+)  # 60MB — generous headroom over the 30-50MB use case named for it
 
 # Explicit allowlist only — content types NOT in this map get ".bin" and
 # are always forced to download (never rendered inline), regardless of
@@ -96,7 +98,9 @@ _EXTENSION_FOR: dict[str, str] = {
 # X-Content-Type-Options: nosniff gateway's security_headers_middleware
 # already sets, is what stops an uploaded .html/.svg/.js from ever being
 # rendered same-origin (docs §9/§12 #3).
-_INLINE_ALLOWLIST = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"})
+_INLINE_ALLOWLIST = frozenset(
+    {"image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"}
+)
 
 # Verdicts a dedup source may safely hand its checksum-sibling without a
 # fresh scan (docs §6's table) — anything not covered here (pending,
@@ -246,10 +250,14 @@ class FilerProvider:
 
         allowed = self.allowed_content_types()
         if allowed is not None and content_type not in allowed:
-            arc.relay.throw(f"content type '{content_type}' is not allowed", code="content_type_not_allowed")
+            arc.relay.throw(
+                f"content type '{content_type}' is not allowed", code="content_type_not_allowed"
+            )
         max_bytes = self.max_upload_bytes()
         if max_bytes is not None and len(content) > max_bytes:
-            arc.relay.throw(f"file exceeds the {max_bytes}-byte upload limit", code="file_too_large")
+            arc.relay.throw(
+                f"file exceeds the {max_bytes}-byte upload limit", code="file_too_large"
+            )
 
         normalized_path = _normalize_path(path)
         checksum = hashlib.sha256(content).hexdigest()
@@ -305,7 +313,11 @@ class FilerProvider:
             return infected
         rows = await arc.relay.list(
             "filerfile",
-            filters={"checksum": checksum, "storage": "local", "status": {"in": ["clean", "skipped", "pending"]}},
+            filters={
+                "checksum": checksum,
+                "storage": "local",
+                "status": {"in": ["clean", "skipped", "pending"]},
+            },
             order_by=["-created_at"],
             limit=1,
         )
@@ -361,10 +373,17 @@ class FilerProvider:
         if not ids:
             return rows
 
+        # limit=None: this must resolve metadata for EVERY id in `ids`, not
+        # just the first DEFAULT_LIST_LIMIT of them — the batch is already
+        # bounded by however many distinct file references `rows` (the
+        # caller's own, separately-limited fetch) actually contained.
         meta = {
             m["file_id"]: m
             for m in await arc.relay.list(
-                "filerfile", filters={"file_id": {"in": list(ids)}}, fields=["file_id", "private", "status"]
+                "filerfile",
+                filters={"file_id": {"in": list(ids)}},
+                fields=["file_id", "private", "status"],
+                limit=None,
             )
         }
 
@@ -407,7 +426,9 @@ class FilerProvider:
         row = await arc.relay.get("filerfile", {"file_id": file_id})
         if row is None or row["status"] == "deleted":
             return
-        await arc.relay.save("filerfile", {"id": row["id"], "status": "deleted", "deleted_at": utcnow()})
+        await arc.relay.save(
+            "filerfile", {"id": row["id"], "status": "deleted", "deleted_at": utcnow()}
+        )
 
     # ------------------------------------------------------------------ #
     # FILE/MULTIFILE discovery — automatic, via the schema registry (docs
@@ -467,8 +488,13 @@ class _UrlResolver(FieldResolver):
                 ids.add(str(val))
         if not ids:
             return {}
+        # limit=None — same reasoning as _resolve_urls above: must resolve
+        # every id this batch was given, already bounded by `ids` itself.
         rows = await arc.relay.list(
-            "filerfile", filters={"file_id": {"in": list(ids)}}, fields=["file_id", "private", "status"]
+            "filerfile",
+            filters={"file_id": {"in": list(ids)}},
+            fields=["file_id", "private", "status"],
+            limit=None,
         )
         return {row["file_id"]: row for row in rows}
 
@@ -483,7 +509,9 @@ class _UrlResolver(FieldResolver):
             return self.provider._url_for(meta, self.ttl_seconds)
 
         if isinstance(raw_value, list):
-            return [{"label": entry.get("label"), "url": _url(entry["fileid"])} for entry in raw_value]
+            return [
+                {"label": entry.get("label"), "url": _url(entry["fileid"])} for entry in raw_value
+            ]
         return _url(str(raw_value))
 
 
@@ -510,7 +538,9 @@ async def _reap_after_save(ctx: Any) -> None:
 async def _mark_deleted(file_id: str) -> None:
     row = await arc.relay.get("filerfile", {"file_id": file_id})
     if row is not None and row["status"] != "deleted":
-        await arc.relay.save("filerfile", {"id": row["id"], "status": "deleted", "deleted_at": utcnow()})
+        await arc.relay.save(
+            "filerfile", {"id": row["id"], "status": "deleted", "deleted_at": utcnow()}
+        )
 
 
 async def _scan(filerfile_id: str) -> None:
@@ -524,7 +554,9 @@ async def _scan(filerfile_id: str) -> None:
         return
     content = await PROVIDERS[row["storage"]].read(row["storage_key"])
     infected = await _clamd_scan(content)
-    await arc.relay.save("filerfile", {"id": row["id"], "status": "infected" if infected else "clean"})
+    await arc.relay.save(
+        "filerfile", {"id": row["id"], "status": "infected" if infected else "clean"}
+    )
 
 
 async def _clamd_scan(content: bytes) -> bool:

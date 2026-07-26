@@ -103,9 +103,9 @@ class LocalProvider:
             dst = self._resolve(new_key)
             dst.parent.mkdir(parents=True, exist_ok=True)
             try:
-                os.link(src, dst)   # hardlink: same inode, new directory entry
+                os.link(src, dst)  # hardlink: same inode, new directory entry
             except OSError:
-                shutil.copyfile(src, dst)   # cross-device, unsupported FS, etc.
+                shutil.copyfile(src, dst)  # cross-device, unsupported FS, etc.
 
         await asyncio.to_thread(_do)
 
@@ -132,13 +132,19 @@ class S3Provider:
     def _bucket(self) -> str:
         bucket = arc.settings.get("filer_s3_bucket")
         if not bucket:
-            raise RuntimeError("filer_s3_bucket is not set — run: arc settings set filer_s3_bucket <name>")
+            raise RuntimeError(
+                "filer_s3_bucket is not set — run: arc settings set filer_s3_bucket <name>"
+            )
         return bucket
 
     async def save(self, key: str, content: bytes, *, content_type: str) -> None:
         def _do() -> None:
             self._client().put_object(
-                Bucket=self._bucket(), Key=key, Body=content, ContentType=content_type, ACL="private"
+                Bucket=self._bucket(),
+                Key=key,
+                Body=content,
+                ContentType=content_type,
+                ACL="private",
             )
 
         await asyncio.to_thread(_do)
@@ -171,7 +177,9 @@ class S3Provider:
         await asyncio.to_thread(_do)
 
     async def link_or_copy(self, existing_key: str, new_key: str) -> None:
-        raise NotImplementedError("S3 dedup is a v1 non-goal — see docs/filer-attachment-storage-proposal.md §3")
+        raise NotImplementedError(
+            "S3 dedup is a v1 non-goal — see docs/filer-attachment-storage-proposal.md §3"
+        )
 
 
 PROVIDERS: dict[str, StorageProvider] = {"local": LocalProvider(), "s3": S3Provider()}
