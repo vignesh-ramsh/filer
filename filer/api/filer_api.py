@@ -95,7 +95,7 @@ async def serve_file(file_id: str, exp: int | str | None = None, sig: str | None
     from filer.tokens import verify
     from gateway.request import StreamResponse
 
-    row = await arc.relay.get("filerfile", {"file_id": file_id})
+    row = await arc.relay.get("filerfile", {"file_id": file_id}, arc.relay.all_columns("filerfile"))
     if row is None or row["status"] not in ("clean", "skipped"):
         arc.relay.throw("not found", status=404, code="not_found")
     if row["private"]:

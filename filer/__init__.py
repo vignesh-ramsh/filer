@@ -307,12 +307,15 @@ class FilerProvider:
         recently seen clean/skipped/pending row. 'deleted' rows are never
         sources — the purge job could unlink one mid-race."""
         infected = await arc.relay.get(
-            "filerfile", {"checksum": checksum, "storage": "local", "status": "infected"}
+            "filerfile",
+            {"checksum": checksum, "storage": "local", "status": "infected"},
+            arc.relay.all_columns("filerfile"),
         )
         if infected is not None:
             return infected
         rows = await arc.relay.list(
             "filerfile",
+            fields=arc.relay.all_columns("filerfile"),
             filters={
                 "checksum": checksum,
                 "storage": "local",
@@ -339,7 +342,7 @@ class FilerProvider:
     # Read primitives
     # ------------------------------------------------------------------ #
     async def get_file(self, file_id: str) -> dict | None:
-        return await arc.relay.get("filerfile", {"file_id": file_id})
+        return await arc.relay.get("filerfile", {"file_id": file_id}, arc.relay.all_columns("filerfile"))
 
     def _url_for(self, row: dict, ttl_seconds: int | None = None) -> str:
         from filer.tokens import sign
@@ -353,7 +356,9 @@ class FilerProvider:
         return f"{uri}?exp={expires}&sig={sig}"
 
     async def sign_url(self, file_id: str, *, ttl_seconds: int | None = None) -> str:
-        row = await arc.relay.get("filerfile", {"file_id": file_id})
+        row = await arc.relay.get(
+            "filerfile", {"file_id": file_id}, arc.relay.all_columns("filerfile")
+        )
         if row is None or row["status"] not in ("clean", "skipped"):
             arc.relay.throw("file not found", status=404, code="not_found")
         return self._url_for(row, ttl_seconds)
@@ -423,7 +428,9 @@ class FilerProvider:
         return _UrlResolver(field=field, provider=self, ttl_seconds=ttl_seconds)
 
     async def delete(self, file_id: str) -> None:
-        row = await arc.relay.get("filerfile", {"file_id": file_id})
+        row = await arc.relay.get(
+            "filerfile", {"file_id": file_id}, ["id", "status"]
+        )
         if row is None or row["status"] == "deleted":
             return
         await arc.relay.save(
@@ -536,7 +543,7 @@ async def _reap_after_save(ctx: Any) -> None:
 
 
 async def _mark_deleted(file_id: str) -> None:
-    row = await arc.relay.get("filerfile", {"file_id": file_id})
+    row = await arc.relay.get("filerfile", {"file_id": file_id}, ["id", "status"])
     if row is not None and row["status"] != "deleted":
         await arc.relay.save(
             "filerfile", {"id": row["id"], "status": "deleted", "deleted_at": utcnow()}
@@ -546,7 +553,7 @@ async def _mark_deleted(file_id: str) -> None:
 async def _scan(filerfile_id: str) -> None:
     from filer.providers import PROVIDERS
 
-    row = await arc.relay.get("filerfile", filerfile_id)
+    row = await arc.relay.get("filerfile", filerfile_id, ["id", "private", "storage", "storage_key"])
     if row is None:
         return
     if not arc.filer.scan_enabled(private=row["private"]):

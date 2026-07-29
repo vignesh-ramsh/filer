@@ -28,7 +28,10 @@ async def purge_deleted_files() -> None:
     # Deliberately unbounded — every eligible row must actually be purged,
     # not just the first DEFAULT_LIST_LIMIT of them each run.
     rows = await arc.relay.list(
-        "filerfile", filters={"status": "deleted", "deleted_at": {"lte": cutoff}}, limit=None
+        "filerfile",
+        fields=["id", "storage", "storage_key"],
+        filters={"status": "deleted", "deleted_at": {"lte": cutoff}},
+        limit=None,
     )
     for row in rows:
         await PROVIDERS[row["storage"]].delete(row["storage_key"])
