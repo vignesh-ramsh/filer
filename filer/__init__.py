@@ -452,11 +452,57 @@ class FilerProvider:
             return
         _FILE_FIELDS[table] = fields
         relay = self._kernel.get("relay")
+        relay.add_hook(table, "validate", _validate_file_fields)
         relay.add_hook(table, "after_delete", _reap_after_delete)
         relay.add_hook(table, "after_save", _reap_after_save)
 
 
+async def _validate_file_fields(ctx: Any) -> None:
+    """Rejects a malformed FILE/MULTIFILE value with a proper 400 BEFORE
+    the write happens — added after a hand-typed MULTIFILE JSON textarea
+    value (admin-desk's FieldInput.tsx only checks "is this a JSON array",
+    not each element's shape) reached _reap_after_save's _collect() as a
+    raw AttributeError, which Gateway can only turn into a generic 500
+    (it special-cases HTTPError/RelayError, nothing else). Only checks
+    fields actually present in ctx.payload — an untouched field on this
+    write isn't re-validated just because the row happens to carry one
+    (that's _collect's job to survive gracefully, not this hook's job to
+    police retroactively)."""
+    fields = _FILE_FIELDS.get(ctx.table, {})
+    for name, kind in fields.items():
+        if name not in ctx.payload:
+            continue
+        val = ctx.payload[name]
+        if not val:
+            continue
+        if kind == "FILE":
+            if not isinstance(val, str):
+                arc.relay.throw(
+                    f"{name}: must be a file_id string, got {type(val).__name__}.",
+                    code="invalid_file_value",
+                )
+        else:  # MULTIFILE
+            if not isinstance(val, list):
+                arc.relay.throw(
+                    f'{name}: must be a JSON array of {{"label", "fileid"}} objects, '
+                    f"got {type(val).__name__}.",
+                    code="invalid_multifile_value",
+                )
+            for i, entry in enumerate(val):
+                if not isinstance(entry, dict) or not entry.get("fileid"):
+                    arc.relay.throw(
+                        f"{name}[{i}]: must be an object with a 'fileid' key, "
+                        f"got {entry!r}.",
+                        code="invalid_multifile_entry",
+                    )
+
+
 def _collect(row: dict | None, fields: dict[str, str], into: set[str]) -> None:
+    """Defensive on purpose, independent of _validate_file_fields above:
+    this runs from after_delete/after_save against whatever is ALREADY
+    persisted (ctx.old/ctx.new), which can predate this validation (older
+    rows, a direct DB write, a future bug) — a malformed entry here should
+    never crash a cleanup hook, just get skipped rather than reaped."""
     if row is None:
         return
     for name, kind in fields.items():
@@ -464,9 +510,14 @@ def _collect(row: dict | None, fields: dict[str, str], into: set[str]) -> None:
         if not val:
             continue
         if kind == "FILE":
-            into.add(str(val))
+            if isinstance(val, str):
+                into.add(val)
         else:  # MULTIFILE
+            if not isinstance(val, list):
+                continue
             for entry in val:
+                if not isinstance(entry, dict):
+                    continue
                 fid = entry.get("fileid")
                 if fid:
                     into.add(str(fid))
