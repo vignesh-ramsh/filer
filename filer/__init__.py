@@ -155,7 +155,7 @@ class FilerProvider:
     # Settings
     # ------------------------------------------------------------------ #
     def default_storage(self) -> str:
-        return arc.settings.get(DEFAULT_STORAGE_KEY) or DEFAULT_STORAGE
+        return arc.settings.get(DEFAULT_STORAGE_KEY)
 
     def allowed_content_types(self) -> set[str] | None:
         raw = arc.settings.get(ALLOWED_CONTENT_TYPES_KEY)
@@ -164,19 +164,17 @@ class FilerProvider:
         return {t.strip() for t in raw.split(",") if t.strip()}
 
     def max_upload_bytes(self) -> int | None:
-        raw = arc.settings.get(MAX_UPLOAD_BYTES_KEY)
-        return int(raw) if raw else None
+        return arc.settings.get(MAX_UPLOAD_BYTES_KEY)
 
     def scan_enabled(self, *, private: bool) -> bool:
         key = SCAN_PRIVATE_KEY if private else SCAN_PUBLIC_KEY
-        return (arc.settings.get(key) or "").lower() in ("1", "true", "yes")
+        return arc.settings.get(key)
 
     def clamav_socket(self) -> str:
-        return arc.settings.get(CLAMAV_SOCKET_KEY) or DEFAULT_CLAMAV_SOCKET
+        return arc.settings.get(CLAMAV_SOCKET_KEY)
 
     def max_request_body_bytes(self) -> int:
-        raw = arc.settings.get(MAX_REQUEST_BODY_BYTES_KEY)
-        return int(raw) if raw else DEFAULT_MAX_REQUEST_BODY_BYTES
+        return arc.settings.get(MAX_REQUEST_BODY_BYTES_KEY)
 
     async def antivirus_status(self) -> dict:
         """Live connectivity check against the configured ClamAV socket —
@@ -207,12 +205,10 @@ class FilerProvider:
         }
 
     def purge_after_days(self) -> int:
-        raw = arc.settings.get(PURGE_AFTER_DAYS_KEY)
-        return int(raw) if raw else DEFAULT_PURGE_AFTER_DAYS
+        return arc.settings.get(PURGE_AFTER_DAYS_KEY)
 
     def default_link_ttl_seconds(self) -> int:
-        raw = arc.settings.get(DEFAULT_LINK_TTL_KEY)
-        return int(raw) if raw else DEFAULT_LINK_TTL_SECONDS
+        return arc.settings.get(DEFAULT_LINK_TTL_KEY)
 
     def _signing_secret(self) -> str:
         """Auto-generated on first use if unset — mirrors how `.arc/arc.mkey`
@@ -688,22 +684,55 @@ def _ensure_scaffold(root: Path) -> None:
 
 
 def register(kernel: Any) -> None:
-    kernel.settings.declare(LOCAL_ROOT_KEY)
-    kernel.settings.declare(DEFAULT_STORAGE_KEY)
-    kernel.settings.declare(ALLOWED_CONTENT_TYPES_KEY)
-    kernel.settings.declare(MAX_UPLOAD_BYTES_KEY)
-    kernel.settings.declare(SCAN_PUBLIC_KEY)
-    kernel.settings.declare(SCAN_PRIVATE_KEY)
-    kernel.settings.declare(CLAMAV_SOCKET_KEY)
-    kernel.settings.declare(PURGE_AFTER_DAYS_KEY)
-    kernel.settings.declare(DEFAULT_LINK_TTL_KEY)
-    kernel.settings.declare(SIGNING_SECRET_KEY, secret=True)
-    kernel.settings.declare(S3_BUCKET_KEY)
-    kernel.settings.declare(S3_REGION_KEY)
-    kernel.settings.declare(S3_ENDPOINT_URL_KEY)
+    # Typed declare (matching authn/gateway's own adoption of this,
+    # arc/arc/settings.py's declare()) — every FilerProvider settings
+    # method below reads an already-coerced, already-defaulted value
+    # instead of hand-parsing a raw string, and a bad value (e.g.
+    # filer_purge_after_days set to "a month") now fails at arc.boot()
+    # naming the setting, instead of surfacing wherever the purge task
+    # first runs. allowed_content_types stays untyped: it's a
+    # comma-separated SET, and declare()'s `type` only covers
+    # int/float/bool/str, no collection support.
+    kernel.settings.declare(LOCAL_ROOT_KEY, doc="Local storage root — defaults to <project>/files.")
+    kernel.settings.declare(DEFAULT_STORAGE_KEY, default=DEFAULT_STORAGE, doc="'local' or 's3'.")
+    kernel.settings.declare(
+        ALLOWED_CONTENT_TYPES_KEY,
+        doc="Comma-separated allowed MIME types. Empty/unset allows any.",
+    )
+    kernel.settings.declare(
+        MAX_UPLOAD_BYTES_KEY, type=int, default=None, doc="Per-file upload ceiling. Unset = no cap."
+    )
+    kernel.settings.declare(
+        SCAN_PUBLIC_KEY, type=bool, default=False, doc="Run antivirus scanning on public uploads."
+    )
+    kernel.settings.declare(
+        SCAN_PRIVATE_KEY, type=bool, default=False, doc="Run antivirus scanning on private uploads."
+    )
+    kernel.settings.declare(CLAMAV_SOCKET_KEY, default=DEFAULT_CLAMAV_SOCKET, doc="clamd socket path.")
+    kernel.settings.declare(
+        PURGE_AFTER_DAYS_KEY,
+        type=int,
+        default=DEFAULT_PURGE_AFTER_DAYS,
+        doc="Days before a soft-deleted file is purged for good.",
+    )
+    kernel.settings.declare(
+        DEFAULT_LINK_TTL_KEY,
+        type=int,
+        default=DEFAULT_LINK_TTL_SECONDS,
+        doc="Signed-URL default TTL, in seconds.",
+    )
+    kernel.settings.declare(SIGNING_SECRET_KEY, secret=True, doc="Auto-generated on first use if unset.")
+    kernel.settings.declare(S3_BUCKET_KEY, doc="S3 bucket name — required when default_storage is 's3'.")
+    kernel.settings.declare(S3_REGION_KEY, doc="S3 region.")
+    kernel.settings.declare(S3_ENDPOINT_URL_KEY, doc="Override for an S3-compatible endpoint (non-AWS).")
     kernel.settings.declare(S3_ACCESS_KEY_ID_KEY, secret=True)
     kernel.settings.declare(S3_SECRET_ACCESS_KEY_KEY, secret=True)
-    kernel.settings.declare(MAX_REQUEST_BODY_BYTES_KEY)
+    kernel.settings.declare(
+        MAX_REQUEST_BODY_BYTES_KEY,
+        type=int,
+        default=DEFAULT_MAX_REQUEST_BODY_BYTES,
+        doc="Outer ASGI-level body ceiling for file_upload — bigger than gateway's own default.",
+    )
 
     psqldb = kernel.get("psqldb")
     psqldb.register_model(Path(__file__).parent / "schemas")
