@@ -735,13 +735,13 @@ def register(kernel: Any) -> None:
     )
 
     psqldb = kernel.get("psqldb")
-    psqldb.register_model(Path(__file__).parent / "schemas")
-    psqldb.register_patches(Path(__file__).parent / "patches")
+    psqldb.register_model(Path(__file__).parent.parent / "schemas")
+    psqldb.register_patches(Path(__file__).parent.parent / "patches")
 
     relay = kernel.get("relay")
-    relay.register_hooks(Path(__file__).parent / "hooks")
-    relay.register_api(Path(__file__).parent / "api")
-    relay.register_tasks(Path(__file__).parent / "tasks")
+    relay.register_hooks(Path(__file__).parent.parent / "hooks")
+    relay.register_api(Path(__file__).parent.parent / "api")
+    relay.register_tasks(Path(__file__).parent.parent / "tasks")
 
     from arc.runtime import find_project_root
 
