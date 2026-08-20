@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import arc
 
-from filer import _FILE_FIELDS, _collect, utcnow
+from filer import _FILE_FIELDS, _collect
 
 
 @arc.relay.task(queue="default", cron="0 3 * * *")
@@ -34,5 +34,5 @@ async def reconcile_orphaned_files() -> None:
     for row in candidates:
         if row["file_id"] not in referenced:
             await arc.relay.save(
-                "filerfile", {"id": row["id"], "status": "deleted", "deleted_at": utcnow()}
+                "filerfile", {"id": row["id"], "status": "deleted", "deleted_at": arc.tz.utcnow()}
             )

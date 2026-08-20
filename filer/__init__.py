@@ -30,7 +30,6 @@ import re
 import secrets
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -141,10 +140,6 @@ def _normalize_path(path: str | None) -> str:
                 code="invalid_path",
             )
     return "/".join(segments)
-
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 class FilerProvider:
@@ -430,7 +425,7 @@ class FilerProvider:
         if row is None or row["status"] == "deleted":
             return
         await arc.relay.save(
-            "filerfile", {"id": row["id"], "status": "deleted", "deleted_at": utcnow()}
+            "filerfile", {"id": row["id"], "status": "deleted", "deleted_at": arc.tz.utcnow()}
         )
 
     # ------------------------------------------------------------------ #
@@ -593,7 +588,7 @@ async def _mark_deleted(file_id: str) -> None:
     row = await arc.relay.get("filerfile", {"file_id": file_id}, ["id", "status"])
     if row is not None and row["status"] != "deleted":
         await arc.relay.save(
-            "filerfile", {"id": row["id"], "status": "deleted", "deleted_at": utcnow()}
+            "filerfile", {"id": row["id"], "status": "deleted", "deleted_at": arc.tz.utcnow()}
         )
 
 

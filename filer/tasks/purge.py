@@ -13,18 +13,14 @@ by a scheduling coincidence.
 
 from __future__ import annotations
 
-from datetime import timedelta
-
 import arc
-
-from filer import utcnow
 
 
 @arc.relay.task(queue="default", cron="0 4 * * *")
 async def purge_deleted_files() -> None:
     from filer.providers import PROVIDERS
 
-    cutoff = utcnow() - timedelta(days=arc.filer.purge_after_days())
+    cutoff = arc.tz.ago(days=arc.filer.purge_after_days())
     # Deliberately unbounded — every eligible row must actually be purged,
     # not just the first DEFAULT_LIST_LIMIT of them each run.
     rows = await arc.relay.list(
