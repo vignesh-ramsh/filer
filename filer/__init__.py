@@ -206,16 +206,25 @@ class FilerProvider:
         return arc.settings.get(DEFAULT_LINK_TTL_KEY)
 
     def _signing_secret(self) -> str:
-        """Auto-generated on first use if unset — mirrors how `.arc/arc.mkey`
-        bootstraps itself — rather than requiring a manual `arc settings
-        set` before the plugin works at all. Read fresh every call (not
-        cached at construction) so a manually-rotated secret takes effect
-        without a restart, same reasoning as LocalProvider's own root."""
+        """Generated once, at boot, by register()'s own _ensure_signing_secret
+        (see its docstring for why NOT lazily here on first use, the old
+        shape) — mirrors how `.arc/arc.mkey` bootstraps itself, rather than
+        requiring a manual `arc settings set` before the plugin works at
+        all. Read fresh every call (not cached at construction) so a
+        manually-rotated secret takes effect without a restart, same
+        reasoning as LocalProvider's own root.
+
+        register() guarantees this is already set by the time any request
+        can reach here — a missing value at this point means register()
+        itself never ran (this FilerProvider was constructed outside a
+        normal arc.boot()), not a race to paper over here."""
         value = arc.settings.get(SIGNING_SECRET_KEY, reveal=True)
-        if value:
-            return value
-        value = secrets.token_urlsafe(32)
-        arc.settings.set(SIGNING_SECRET_KEY, value, secret=True)
+        if not value:
+            raise RuntimeError(
+                f"'{SIGNING_SECRET_KEY}' is unset — filer.register() should have "
+                f"generated it at boot; was this FilerProvider constructed without "
+                f"going through arc.boot()?"
+            )
         return value
 
     # ------------------------------------------------------------------ #
@@ -678,6 +687,42 @@ def _ensure_scaffold(root: Path) -> None:
         (d / ".gitkeep").touch(exist_ok=True)
 
 
+def _ensure_signing_secret(kernel: Any) -> None:
+    """Generates filer_signing_secret ONCE, here at boot — not lazily on
+    the first signed URL (FilerProvider._signing_secret's old shape).
+
+    A lazy read-then-write on the request path races across every
+    Granian worker PROCESS on a fresh install: each one misses, generates
+    a DIFFERENT secret, and writes it — last writer wins, and every URL
+    ANY earlier worker already signed becomes permanently unverifiable (a
+    403 that looks like an ordinary link expiry, not a config bug).
+    Moving the read-then-write to register() alone isn't enough by
+    itself, though — N worker processes still boot roughly
+    simultaneously, so the check-then-write itself needs a real
+    cross-process lock, not just an earlier place in the code to run it.
+
+    flock() on a dedicated lock file, not a Postgres advisory lock
+    (psqldb.migrate.migration_lock's own pattern, the precedent this
+    otherwise follows): register() runs synchronously, and there's no
+    guarantee psqldb's pool is open yet at this exact point in boot, so
+    there's no connection available to lock against here."""
+    if kernel.settings.get(SIGNING_SECRET_KEY, reveal=True):
+        return
+
+    import fcntl
+
+    lock_path = kernel.settings.arc_dir / "filer_signing_secret.lock"
+    with open(lock_path, "a+") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            # Re-check under the lock — another worker may have already
+            # generated and written one while this process waited for it.
+            if not kernel.settings.get(SIGNING_SECRET_KEY, reveal=True):
+                kernel.settings.set(SIGNING_SECRET_KEY, secrets.token_urlsafe(32), secret=True)
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
 def register(kernel: Any) -> None:
     # Typed declare (matching authn/gateway's own adoption of this,
     # arc/arc/settings.py's declare()) — every FilerProvider settings
@@ -716,7 +761,8 @@ def register(kernel: Any) -> None:
         default=DEFAULT_LINK_TTL_SECONDS,
         doc="Signed-URL default TTL, in seconds.",
     )
-    kernel.settings.declare(SIGNING_SECRET_KEY, secret=True, doc="Auto-generated on first use if unset.")
+    kernel.settings.declare(SIGNING_SECRET_KEY, secret=True, doc="Auto-generated at boot if unset.")
+    _ensure_signing_secret(kernel)
     kernel.settings.declare(S3_BUCKET_KEY, doc="S3 bucket name — required when default_storage is 's3'.")
     kernel.settings.declare(S3_REGION_KEY, doc="S3 region.")
     kernel.settings.declare(S3_ENDPOINT_URL_KEY, doc="Override for an S3-compatible endpoint (non-AWS).")
