@@ -17,7 +17,9 @@ that already passed its own role gate).
 
 from __future__ import annotations
 
+import re
 from typing import Any
+from urllib.parse import quote
 
 import arc
 
@@ -26,6 +28,32 @@ from filer import MAX_REQUEST_BODY_BYTES_KEY, DEFAULT_MAX_REQUEST_BODY_BYTES
 _INLINE_ALLOWLIST = frozenset(
     {"image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"}
 )
+
+# original_filename is whatever the uploader's browser sent as the
+# multipart filename= parameter (gateway.multipart._param) — stored
+# verbatim, never sanitized on the way in. Two failure modes this closes,
+# both confirmed directly against this exact f-string:
+#   * CR/LF survive .encode("latin-1") intact — a filename like
+#     'a"\r\nSet-Cookie: x=1\r\n' becomes a second header line once this
+#     value reaches send_stream's own header encoding.
+#   * Any character outside latin-1 (any CJK/Cyrillic name, an emoji)
+#     raises UnicodeEncodeError INSIDE send_stream, after
+#     http.response.start has already been sent — the download simply
+#     breaks for that file, every time.
+_DISPOSITION_STRIP_RE = re.compile(r'[\r\n"\\\x00-\x1f\x7f]')
+
+
+def _content_disposition(filename: str) -> str:
+    """RFC 6266: an ASCII-safe `filename` for clients that don't parse
+    `filename*`, plus a percent-encoded `filename*=UTF-8''...` for
+    everything else — so a non-Latin-1 name still downloads with its real
+    name instead of crashing the response. CR/LF/quote/control characters
+    are stripped outright rather than escaped: none are legitimate in a
+    filename, and any of them ending up in this exact position is a
+    header-injection attempt, not a genuine name."""
+    cleaned = _DISPOSITION_STRIP_RE.sub("_", filename or "").strip() or "download"
+    ascii_name = cleaned.encode("ascii", "replace").decode("ascii")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(cleaned, safe='')}"
 
 # Computed once, at import time (this module loads during relay
 # .register_api() -> filer.register(), by which point filer's own
@@ -123,7 +151,7 @@ async def serve_file(file_id: str, exp: int | str | None = None, sig: str | None
 
     provider = PROVIDERS[row["storage"]]
     inline = row["content_type"] in _INLINE_ALLOWLIST
-    disposition = "inline" if inline else f'attachment; filename="{row["original_filename"]}"'
+    disposition = "inline" if inline else _content_disposition(row["original_filename"])
     headers = {"Content-Disposition": disposition}
     if inline:
         # SAMEORIGIN, not the gateway-wide default DENY (see
