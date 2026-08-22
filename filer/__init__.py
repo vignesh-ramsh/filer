@@ -48,6 +48,7 @@ CLAMAV_SOCKET_KEY = "filer_clamav_socket"
 PURGE_AFTER_DAYS_KEY = "filer_purge_after_days"
 DEFAULT_LINK_TTL_KEY = "filer_default_link_ttl_seconds"
 SIGNING_SECRET_KEY = "filer_signing_secret"
+URL_SIGNING_SCHEME_KEY = "filer_url_signing_scheme"
 S3_BUCKET_KEY = "filer_s3_bucket"
 S3_REGION_KEY = "filer_s3_region"
 S3_ENDPOINT_URL_KEY = "filer_s3_endpoint_url"
@@ -205,6 +206,26 @@ class FilerProvider:
     def default_link_ttl_seconds(self) -> int:
         return arc.settings.get(DEFAULT_LINK_TTL_KEY)
 
+    def url_signing_scheme(self) -> str:
+        """"md5" (the default — nginx secure_link_md5 parity, see
+        filer.tokens' own module docstring for why that stays the
+        default) or "hmac-sha256" (stronger, opt-in, breaks nginx
+        parity). Validated here, not via declare()'s own `type=` (which
+        only covers int/float/bool/str, no enum support) — a bad value
+        fails clearly the moment anything tries to sign or verify a URL,
+        naming exactly what's wrong and what's allowed, rather than
+        silently falling back to a different scheme than the operator
+        typed."""
+        from filer import tokens
+
+        value = arc.settings.get(URL_SIGNING_SCHEME_KEY) or tokens.DEFAULT_SCHEME
+        if value not in tokens.SCHEMES:
+            raise RuntimeError(
+                f"'{URL_SIGNING_SCHEME_KEY}' is set to {value!r} — must be one of "
+                f"{sorted(tokens.SCHEMES)}."
+            )
+        return value
+
     def _signing_secret(self) -> str:
         """Generated once, at boot, by register()'s own _ensure_signing_secret
         (see its docstring for why NOT lazily here on first use, the old
@@ -352,7 +373,7 @@ class FilerProvider:
             return uri
         ttl = ttl_seconds or self.default_link_ttl_seconds()
         expires = int(time.time()) + ttl
-        sig = sign(uri, expires, self._signing_secret())
+        sig = sign(uri, expires, self._signing_secret(), scheme=self.url_signing_scheme())
         return f"{uri}?exp={expires}&sig={sig}"
 
     async def sign_url(self, file_id: str, *, ttl_seconds: int | None = None) -> str:
@@ -760,6 +781,14 @@ def register(kernel: Any) -> None:
         type=int,
         default=DEFAULT_LINK_TTL_SECONDS,
         doc="Signed-URL default TTL, in seconds.",
+    )
+    kernel.settings.declare(
+        URL_SIGNING_SCHEME_KEY,
+        default="md5",
+        doc="'md5' (default — required for nginx secure_link_md5 parity, see "
+        "filer.tokens' own module docstring) or 'hmac-sha256' (stronger, but "
+        "only safe to change if nginx isn't independently validating these "
+        "URLs itself).",
     )
     kernel.settings.declare(SIGNING_SECRET_KEY, secret=True, doc="Auto-generated at boot if unset.")
     _ensure_signing_secret(kernel)

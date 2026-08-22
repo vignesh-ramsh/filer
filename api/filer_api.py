@@ -145,7 +145,13 @@ async def serve_file(file_id: str, exp: int | str | None = None, sig: str | None
         if not (
             exp_int is not None
             and sig
-            and verify(f"/files/{file_id}", exp_int, sig, arc.filer._signing_secret())
+            and verify(
+                f"/files/{file_id}",
+                exp_int,
+                sig,
+                arc.filer._signing_secret(),
+                scheme=arc.filer.url_signing_scheme(),
+            )
         ):
             arc.relay.throw("forbidden", status=403, code="forbidden")
 
