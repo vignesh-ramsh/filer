@@ -1,6 +1,6 @@
 # schemas/
 
-One JSON file per table this plugin OWNS (creates). Loaded via `psqldb.register_model(...)` in `__init__.py`. The filename (minus `.json`) becomes the table's file **stem** — the only valid value for a REFERENCE/TABLE field's `target` elsewhere, never the physical, slugified table name (docs/arc.MD §3.9).
+One JSON file per table this plugin OWNS (creates). Loaded via `pgdb.register_model(...)` in `__init__.py`. The filename (minus `.json`) becomes the table's file **stem** — the only valid value for a REFERENCE/TABLE field's `target` elsewhere, never the physical, slugified table name (docs/arc.MD §3.9).
 
 Every normal table must declare at least one business `"unique": true` field of its own (not just the auto-injected `id`).
 
@@ -20,5 +20,5 @@ Example — `Department.json`:
 ```
 
 After adding or changing a schema file:
-1. `arc psqldb plan` — preview the diff, never touches the DB.
-2. `arc psqldb migrate` — apply it (run this yourself).
+1. `arc pgdb plan` — preview the diff, never touches the DB.
+2. `arc pgdb migrate` — apply it (run this yourself).

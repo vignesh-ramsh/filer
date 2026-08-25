@@ -462,12 +462,12 @@ class FilerProvider:
     # FILE/MULTIFILE discovery — automatic, via the schema registry (docs
     # §4). No per-plugin registration call: filer sweeps every schema
     # already registered at its own register() time, then subscribes to
-    # psqldb.on_schema_registered for everything registered afterward
+    # pgdb.on_schema_registered for everything registered afterward
     # (schemas AND patches — a FILE/MULTIFILE field can arrive via either).
     # ------------------------------------------------------------------ #
     def _maybe_watch(self, table: str) -> None:
-        psqldb = self._kernel.get("pgdb")
-        schema = psqldb.schema(table)
+        pgdb = self._kernel.get("pgdb")
+        schema = pgdb.schema(table)
         fields = {f.name: f.type for f in schema.fields if f.type in ("FILE", "MULTIFILE")}
         if not fields:
             return
@@ -723,9 +723,9 @@ def _ensure_signing_secret(kernel: Any) -> None:
     cross-process lock, not just an earlier place in the code to run it.
 
     flock() on a dedicated lock file, not a Postgres advisory lock
-    (psqldb.migrate.migration_lock's own pattern, the precedent this
+    (pgdb.migrate.migration_lock's own pattern, the precedent this
     otherwise follows): register() runs synchronously, and there's no
-    guarantee psqldb's pool is open yet at this exact point in boot, so
+    guarantee pgdb's pool is open yet at this exact point in boot, so
     there's no connection available to lock against here."""
     if kernel.settings.get(SIGNING_SECRET_KEY, reveal=True):
         return
@@ -804,9 +804,9 @@ def register(kernel: Any) -> None:
         doc="Outer ASGI-level body ceiling for file_upload — bigger than gateway's own default.",
     )
 
-    psqldb = kernel.get("pgdb")
-    psqldb.register_model(Path(__file__).parent.parent / "schemas")
-    psqldb.register_patches(Path(__file__).parent.parent / "patches")
+    pgdb = kernel.get("pgdb")
+    pgdb.register_model(Path(__file__).parent.parent / "schemas")
+    pgdb.register_patches(Path(__file__).parent.parent / "patches")
 
     relay = kernel.get("relay")
     relay.register_hooks(Path(__file__).parent.parent / "hooks")
@@ -824,6 +824,6 @@ def register(kernel: Any) -> None:
     # FILE/MULTIFILE discovery (docs §4) — sweep everything already
     # registered (plugins that loaded before filer), then subscribe for
     # everything registered from here on (schemas AND patches).
-    for schema in psqldb.schemas():
+    for schema in pgdb.schemas():
         provider._maybe_watch(schema.table)
-    psqldb.on_schema_registered(provider._maybe_watch)
+    pgdb.on_schema_registered(provider._maybe_watch)
