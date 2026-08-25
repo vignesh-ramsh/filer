@@ -2,5 +2,5 @@
 name = "filer"
 version = "0.1.0"
 capability = "filer"
-requires = ["psqldb", "relay"]
+requires = ["pgdb", "relay"]
 optional_requires = ["gateway"]

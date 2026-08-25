@@ -466,7 +466,7 @@ class FilerProvider:
     # (schemas AND patches — a FILE/MULTIFILE field can arrive via either).
     # ------------------------------------------------------------------ #
     def _maybe_watch(self, table: str) -> None:
-        psqldb = self._kernel.get("psqldb")
+        psqldb = self._kernel.get("pgdb")
         schema = psqldb.schema(table)
         fields = {f.name: f.type for f in schema.fields if f.type in ("FILE", "MULTIFILE")}
         if not fields:
@@ -804,7 +804,7 @@ def register(kernel: Any) -> None:
         doc="Outer ASGI-level body ceiling for file_upload — bigger than gateway's own default.",
     )
 
-    psqldb = kernel.get("psqldb")
+    psqldb = kernel.get("pgdb")
     psqldb.register_model(Path(__file__).parent.parent / "schemas")
     psqldb.register_patches(Path(__file__).parent.parent / "patches")
 
@@ -819,7 +819,7 @@ def register(kernel: Any) -> None:
     _ensure_scaffold(Path(override) if override else find_project_root() / "files")
 
     provider = FilerProvider(kernel)
-    kernel.export(CAPABILITY, provider, requires=["psqldb", "relay"], optional_requires=["gateway"])
+    kernel.export(CAPABILITY, provider, requires=["pgdb", "relay"], optional_requires=["gateway"])
 
     # FILE/MULTIFILE discovery (docs §4) — sweep everything already
     # registered (plugins that loaded before filer), then subscribe for
