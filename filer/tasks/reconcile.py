@@ -21,7 +21,7 @@ async def reconcile_orphaned_files() -> None:
     # at DEFAULT_LIST_LIMIT would let real orphaned files go undetected.
     referenced: set[str] = set()
     for table, fields in _FILE_FIELDS.items():
-        rows = await arc.relay.list(table, fields=list(fields.keys()), limit=None)
+        rows = await arc.relay.list(table, fields=list(fields.keys()), limit=None)  # type: ignore  # scans every FILE/MULTIFILE-watched table by design — module docstring
         for row in rows:
             _collect(row, fields, referenced)
 
