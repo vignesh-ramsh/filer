@@ -754,54 +754,96 @@ def register(kernel: Any) -> None:
     # first runs. allowed_content_types stays untyped: it's a
     # comma-separated SET, and declare()'s `type` only covers
     # int/float/bool/str, no collection support.
-    kernel.settings.declare(LOCAL_ROOT_KEY, doc="Local storage root — defaults to <project>/files.")
-    kernel.settings.declare(DEFAULT_STORAGE_KEY, default=DEFAULT_STORAGE, doc="'local' or 's3'.")
+    kernel.settings.declare(
+        LOCAL_ROOT_KEY,
+        doc="The folder on this server where uploaded files are kept when storage is `local`. If empty, ARC uses a "
+        "`files` folder inside the project.",
+    )
+    kernel.settings.declare(
+        DEFAULT_STORAGE_KEY, default=DEFAULT_STORAGE,
+        doc="Where uploaded files are kept: `local` (a folder on this server) or `s3` (an Amazon S3 bucket or a "
+        "service that works like it). For `s3` you must also set the bucket name and the access keys.",
+    )
     kernel.settings.declare(
         ALLOWED_CONTENT_TYPES_KEY,
-        doc="Comma-separated allowed MIME types. Empty/unset allows any.",
+        doc="Which kinds of file may be uploaded, as a comma-separated list of file types (MIME types) such as "
+        "`image/png,application/pdf`. If empty, any kind of file is allowed.",
     )
     kernel.settings.declare(
-        MAX_UPLOAD_BYTES_KEY, type=int, default=None, doc="Per-file upload ceiling. Unset = no cap."
+        MAX_UPLOAD_BYTES_KEY, type=int, default=None,
+        doc="The biggest single file a user may upload, in bytes. If empty, there is no limit on file size (the "
+        "request limit above still applies)."
     )
     kernel.settings.declare(
-        SCAN_PUBLIC_KEY, type=bool, default=False, doc="Run antivirus scanning on public uploads."
+        SCAN_PUBLIC_KEY, type=bool, default=False,
+        doc="Scan public uploads for viruses with ClamAV before keeping them. ClamAV must be installed and "
+        "`filer_clamav_socket` must point at it. Off by default."
     )
     kernel.settings.declare(
-        SCAN_PRIVATE_KEY, type=bool, default=False, doc="Run antivirus scanning on private uploads."
+        SCAN_PRIVATE_KEY, type=bool, default=False,
+        doc="Scan private uploads for viruses with ClamAV before keeping them. ClamAV must be installed and "
+        "`filer_clamav_socket` must point at it. Off by default."
     )
-    kernel.settings.declare(CLAMAV_SOCKET_KEY, default=DEFAULT_CLAMAV_SOCKET, doc="clamd socket path.")
+    kernel.settings.declare(
+        CLAMAV_SOCKET_KEY, default=DEFAULT_CLAMAV_SOCKET,
+        doc="Where the ClamAV virus scanner listens on this server (the path of its socket file). Used only when "
+        "virus scanning is turned on for uploads.",
+    )
     kernel.settings.declare(
         PURGE_AFTER_DAYS_KEY,
         type=int,
         default=DEFAULT_PURGE_AFTER_DAYS,
-        doc="Days before a soft-deleted file is purged for good.",
+        doc="How many days a deleted file stays in the trash before it is removed for good.",
     )
     kernel.settings.declare(
         DEFAULT_LINK_TTL_KEY,
         type=int,
         default=DEFAULT_LINK_TTL_SECONDS,
-        doc="Signed-URL default TTL, in seconds.",
+        doc="How many seconds a download link made by the file manager works before it expires.",
     )
     kernel.settings.declare(
         URL_SIGNING_SCHEME_KEY,
         default="md5",
-        doc="'md5' (default — required for nginx secure_link_md5 parity, see "
-        "filer.tokens' own module docstring) or 'hmac-sha256' (stronger, but "
-        "only safe to change if nginx isn't independently validating these "
-        "URLs itself).",
+        doc="How download links are signed: `md5` (the default, needed when nginx checks the links itself with "
+        "`secure_link_md5`) or `hmac-sha256` (stronger). Switch to `hmac-sha256` only if nginx does not check "
+        "these links, or they will be refused.",
     )
-    kernel.settings.declare(SIGNING_SECRET_KEY, secret=True, doc="Auto-generated at boot if unset.")
+    kernel.settings.declare(
+        SIGNING_SECRET_KEY, secret=True,
+        doc="A private key used to sign file download links so that nobody can forge one. ARC creates it by itself "
+        "the first time it starts. If you change it, download links you already handed out stop working.",
+    )
     _ensure_signing_secret(kernel)
-    kernel.settings.declare(S3_BUCKET_KEY, doc="S3 bucket name — required when default_storage is 's3'.")
-    kernel.settings.declare(S3_REGION_KEY, doc="S3 region.")
-    kernel.settings.declare(S3_ENDPOINT_URL_KEY, doc="Override for an S3-compatible endpoint (non-AWS).")
-    kernel.settings.declare(S3_ACCESS_KEY_ID_KEY, secret=True)
-    kernel.settings.declare(S3_SECRET_ACCESS_KEY_KEY, secret=True)
+    kernel.settings.declare(
+        S3_BUCKET_KEY,
+        doc="The name of the S3 bucket where files are stored. Required when `filer_default_storage` is `s3`.",
+    )
+    kernel.settings.declare(
+        S3_REGION_KEY,
+        doc="The region of your S3 bucket, for example `ap-south-1`.",
+    )
+    kernel.settings.declare(
+        S3_ENDPOINT_URL_KEY,
+        doc="The web address of an S3-compatible service that is not Amazon, for example MinIO or DigitalOcean "
+        "Spaces. Leave it empty to use Amazon S3.",
+    )
+    kernel.settings.declare(
+        S3_ACCESS_KEY_ID_KEY, secret=True,
+        doc="The access key ID of your S3 account, the 'user name' half of the S3 login. Needed only when files "
+        "are stored in S3 or a service that works like it.",
+    )
+    kernel.settings.declare(
+        S3_SECRET_ACCESS_KEY_KEY, secret=True,
+        doc="The secret access key of your S3 account, the 'password' half of the S3 login. It goes with the "
+        "access key ID. Needed only when files are stored in S3 or a service that works like it.",
+    )
     kernel.settings.declare(
         MAX_REQUEST_BODY_BYTES_KEY,
         type=int,
         default=DEFAULT_MAX_REQUEST_BODY_BYTES,
-        doc="Outer ASGI-level body ceiling for file_upload — bigger than gateway's own default.",
+        doc="The biggest upload request the server accepts for file uploads, in bytes (default 60 MB). It is the "
+        "outer limit, so keep it a little above the biggest file you allow. The limit for one file is "
+        "`filer_max_upload_bytes`.",
     )
 
     pgdb = kernel.get("pgdb")
