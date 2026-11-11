@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Protocol
 
 import arc
+from arc import permissions
 
 
 class StorageProvider(Protocol):
@@ -63,11 +64,23 @@ class LocalProvider:
             raise PathEscapeError(f"storage_key {key!r} resolves outside the storage root {root}")
         return path
 
+    def _make_dirs(self, directory: Path) -> None:
+        """Create `directory` and every missing folder above it (down from the storage root) closed to
+        other users - 0750 - instead of the umask default, which on a typical machine is 0775."""
+        current = self._root()
+        permissions.create_private_dir(current, permissions.SHARED_DIR_MODE)
+        for part in directory.relative_to(current).parts:
+            current = current / part
+            permissions.create_private_dir(current, permissions.SHARED_DIR_MODE)
+
     async def save(self, key: str, content: bytes, *, content_type: str) -> None:
         def _do() -> None:
             path = self._resolve(key)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(content)
+            self._make_dirs(path.parent)
+            # created 0640 from the first byte, never written at the default mode and tightened later
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, permissions.SHARED_FILE_MODE)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
 
         await asyncio.to_thread(_do)
 
@@ -101,11 +114,12 @@ class LocalProvider:
         def _do() -> None:
             src = self._resolve(existing_key)
             dst = self._resolve(new_key)
-            dst.parent.mkdir(parents=True, exist_ok=True)
+            self._make_dirs(dst.parent)
             try:
-                os.link(src, dst)  # hardlink: same inode, new directory entry
+                os.link(src, dst)  # hardlink: same inode (so the same closed mode), new directory entry
             except OSError:
                 shutil.copyfile(src, dst)  # cross-device, unsupported FS, etc.
+                os.chmod(dst, permissions.SHARED_FILE_MODE)
 
         await asyncio.to_thread(_do)
 

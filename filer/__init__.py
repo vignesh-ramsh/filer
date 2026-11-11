@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 import arc
+from arc import permissions
 from relay.resolvers import FieldResolver
 
 CAPABILITY = "filer"
@@ -46,6 +47,7 @@ SCAN_PUBLIC_KEY = "filer_scan_public"
 SCAN_PRIVATE_KEY = "filer_scan_private"
 CLAMAV_SOCKET_KEY = "filer_clamav_socket"
 PURGE_AFTER_DAYS_KEY = "filer_purge_after_days"
+ORPHAN_GRACE_HOURS_KEY = "filer_orphan_grace_hours"
 DEFAULT_LINK_TTL_KEY = "filer_default_link_ttl_seconds"
 SIGNING_SECRET_KEY = "filer_signing_secret"
 URL_SIGNING_SCHEME_KEY = "filer_url_signing_scheme"
@@ -68,6 +70,7 @@ MAX_REQUEST_BODY_BYTES_KEY = "filer_max_request_body_bytes"
 DEFAULT_STORAGE = "local"
 DEFAULT_CLAMAV_SOCKET = "/var/run/clamav/clamd.ctl"
 DEFAULT_PURGE_AFTER_DAYS = 30
+DEFAULT_ORPHAN_GRACE_HOURS = 24
 DEFAULT_LINK_TTL_SECONDS = 300
 DEFAULT_MAX_REQUEST_BODY_BYTES = (
     60 * 1024 * 1024
@@ -202,6 +205,13 @@ class FilerProvider:
 
     def purge_after_days(self) -> int:
         return arc.settings.get(PURGE_AFTER_DAYS_KEY)
+
+    def orphan_grace_hours(self) -> int:
+        """How old a file must be before the nightly cleanup may treat it as
+        abandoned (see tasks/reconcile.py). A file is uploaded first and
+        attached to its record a moment later, so a brand-new file that
+        nothing refers to yet is normal, not an orphan."""
+        return arc.settings.get(ORPHAN_GRACE_HOURS_KEY)
 
     def default_link_ttl_seconds(self) -> int:
         return arc.settings.get(DEFAULT_LINK_TTL_KEY)
@@ -702,9 +712,11 @@ async def _clamd_version(socket_path: str) -> str | None:
 
 
 def _ensure_scaffold(root: Path) -> None:
+    # closed to other users on the machine (0750); an existing folder keeps its mode (`arc doctor --fix`)
+    permissions.create_private_dir(root, permissions.SHARED_DIR_MODE)
     for sub in ("public", "private"):
         d = root / sub
-        d.mkdir(parents=True, exist_ok=True)
+        permissions.create_private_dir(d, permissions.SHARED_DIR_MODE)
         (d / ".gitkeep").touch(exist_ok=True)
 
 
@@ -757,7 +769,9 @@ def register(kernel: Any) -> None:
     kernel.settings.declare(
         LOCAL_ROOT_KEY,
         doc="The folder on this server where uploaded files are kept when storage is `local`. If empty, ARC uses a "
-        "`files` folder inside the project.",
+        "`files` folder inside the project. Changed on the server only (`arc settings set filer_local_root <folder>`): "
+        "ARC serves any file inside it, so it must not be repointable from the admin console.",
+        operator_only=True,
     )
     kernel.settings.declare(
         DEFAULT_STORAGE_KEY, default=DEFAULT_STORAGE,
@@ -794,6 +808,14 @@ def register(kernel: Any) -> None:
         type=int,
         default=DEFAULT_PURGE_AFTER_DAYS,
         doc="How many days a deleted file stays in the trash before it is removed for good.",
+    )
+    kernel.settings.declare(
+        ORPHAN_GRACE_HOURS_KEY,
+        type=int,
+        default=DEFAULT_ORPHAN_GRACE_HOURS,
+        doc="How many hours old a file must be before the nightly cleanup may move it to the trash because nothing "
+        "uses it. Files are uploaded first and attached to their record afterwards, so a new file that nothing uses "
+        "yet is normal; this keeps the cleanup from taking it.",
     )
     kernel.settings.declare(
         DEFAULT_LINK_TTL_KEY,
@@ -853,7 +875,11 @@ def register(kernel: Any) -> None:
     relay = kernel.get("relay")
     relay.register_hooks(Path(__file__).parent.parent / "hooks")
     relay.register_api(Path(__file__).parent.parent / "api")
-    relay.register_tasks(Path(__file__).parent.parent / "tasks")
+    # The tasks live INSIDE the package (filer/tasks/), unlike hooks/ and api/
+    # above which sit at the plugin root. Pointing this at the plugin root
+    # found no directory, registered nothing, and left the nightly reconcile
+    # (03:00) and purge (04:00) unscheduled for as long as filer existed.
+    relay.register_tasks(Path(__file__).parent / "tasks")
 
     from arc.runtime import find_project_root
 
