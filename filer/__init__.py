@@ -66,6 +66,7 @@ S3_SECRET_ACCESS_KEY_KEY = "filer_s3_secret_access_key"
 # default (10MB) without raising that shared ceiling for every other
 # JSON endpoint too.
 MAX_REQUEST_BODY_BYTES_KEY = "filer_max_request_body_bytes"
+STREAM_CHUNK_KB_KEY = "filer_stream_chunk_kb"
 
 DEFAULT_STORAGE = "local"
 DEFAULT_CLAMAV_SOCKET = "/var/run/clamav/clamd.ctl"
@@ -653,12 +654,12 @@ async def _clamd_scan(content: bytes) -> bool:
     Talks to a local clamd over its UNIX socket — the standard local-AV
     integration point, kept behind this one thin function so a different
     scanner could replace it later without touching the rest of filer."""
+    sock_path = arc.filer.clamav_socket()  # a setting: read here on the event loop, not in the thread below
 
     def _do() -> bool:
         import socket
         import struct
 
-        sock_path = arc.filer.clamav_socket()
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.connect(sock_path)
             sock.sendall(b"zINSTREAM\0")
@@ -866,6 +867,14 @@ def register(kernel: Any) -> None:
         doc="The biggest upload request the server accepts for file uploads, in bytes (default 60 MB). It is the "
         "outer limit, so keep it a little above the biggest file you allow. The limit for one file is "
         "`filer_max_upload_bytes`.",
+    )
+    kernel.settings.declare(
+        STREAM_CHUNK_KB_KEY,
+        type=int,
+        default=256,
+        doc="How many kilobytes of a file ARC reads at a time when it sends a download (default 256, kept between "
+        "16 and 4096). Bigger chunks use less processor time when many downloads run at once; smaller ones hold "
+        "less memory per download. Takes effect for the next download.",
     )
 
     pgdb = kernel.get("pgdb")
