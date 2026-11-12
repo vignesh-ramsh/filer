@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import re
 import secrets
 import time
@@ -36,6 +37,9 @@ from typing import Any
 import arc
 from arc import permissions
 from relay.resolvers import FieldResolver
+
+from . import clamd as _clamd
+from . import uploads as _uploads
 
 CAPABILITY = "filer"
 
@@ -66,16 +70,39 @@ S3_SECRET_ACCESS_KEY_KEY = "filer_s3_secret_access_key"
 # default (10MB) without raising that shared ceiling for every other
 # JSON endpoint too.
 MAX_REQUEST_BODY_BYTES_KEY = "filer_max_request_body_bytes"
+#: The same idea for the route that STREAMS its body to disk (`POST /files/upload`): the whole request, file plus
+#: the form around it. Separate from the key above because the two limits protect different things: the one above
+#: bounds a body the gateway holds IN MEMORY (an upload endpoint that reads `request.form()`: hrms's employee
+#: documents), so it stays small; this one bounds a body that is only ever written to disk.
+MAX_UPLOAD_REQUEST_BYTES_KEY = "filer_max_upload_request_bytes"
 STREAM_CHUNK_KB_KEY = "filer_stream_chunk_kb"
+SCAN_MAX_BYTES_KEY = "filer_scan_max_bytes"
+SCAN_TIMEOUT_SECONDS_KEY = "filer_scan_timeout_seconds"
+UPLOAD_STALE_MINUTES_KEY = "filer_upload_stale_minutes"
 
 DEFAULT_STORAGE = "local"
 DEFAULT_CLAMAV_SOCKET = "/var/run/clamav/clamd.ctl"
 DEFAULT_PURGE_AFTER_DAYS = 30
 DEFAULT_ORPHAN_GRACE_HOURS = 24
 DEFAULT_LINK_TTL_SECONDS = 300
+DEFAULT_MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 GiB for one file
+#: The most a file can be, whatever the setting says: `filerfile.size_bytes` is a 32-bit INTEGER column.
+HARD_MAX_UPLOAD_BYTES = 2**31 - 1
+#: What the multipart framing, the part headers and the small form fields add to the file inside one request.
+REQUEST_OVERHEAD_BYTES = 4 * 1024 * 1024
+DEFAULT_MAX_UPLOAD_REQUEST_BYTES = DEFAULT_MAX_UPLOAD_BYTES + REQUEST_OVERHEAD_BYTES
 DEFAULT_MAX_REQUEST_BODY_BYTES = (
     60 * 1024 * 1024
-)  # 60MB — generous headroom over the 30-50MB use case named for it
+)  # 60MB — for a body held in memory; generous headroom over the 30-50MB use case named for it
+#: ClamAV's own default `StreamMaxLength` / `MaxFileSize` is 25 MB: a bigger stream is refused (or, for a file
+#: over `MaxFileSize`, reported clean WITHOUT being scanned unless `AlertExceedsMax yes`), so a bigger file is
+#: not sent. Match this to your clamd.conf.
+DEFAULT_SCAN_MAX_BYTES = 25 * 1024 * 1024
+DEFAULT_SCAN_TIMEOUT_SECONDS = 120
+DEFAULT_UPLOAD_STALE_MINUTES = 60
+SCAN_RETRY_AFTER_MINUTES = 5  # a pending file whose scan did not finish is picked up again after this long
+
+_logger = logging.getLogger("arc.filer")
 
 # Explicit allowlist only — content types NOT in this map get ".bin" and
 # are always forced to download (never rendered inline), regardless of
@@ -147,6 +174,35 @@ def _normalize_path(path: str | None) -> str:
     return "/".join(segments)
 
 
+@dataclass
+class _BytesSource:
+    """An upload whose bytes are in memory."""
+
+    content: bytes
+
+    async def put(self, provider: Any, key: str, content_type: str) -> None:
+        await provider.save(key, self.content, content_type=content_type)
+
+
+@dataclass
+class _FileSource:
+    """An upload whose bytes are in a file on disk (a spool file, usually)."""
+
+    path: Path
+    size: int
+    move: bool
+
+    async def put(self, provider: Any, key: str, content_type: str) -> None:
+        await provider.save_file(key, self.path, size=self.size, content_type=content_type, move=self.move)
+
+
+def _measure(path: Path) -> tuple[int, str]:
+    """The size and SHA-256 of a file, read in pieces. Blocking: run it in a thread."""
+    with open(path, "rb") as handle:
+        digest = hashlib.file_digest(handle, "sha256")
+    return path.stat().st_size, digest.hexdigest()
+
+
 class FilerProvider:
     def __init__(self, kernel: Any) -> None:
         self._kernel = kernel
@@ -163,8 +219,23 @@ class FilerProvider:
             return None
         return {t.strip() for t in raw.split(",") if t.strip()}
 
-    def max_upload_bytes(self) -> int | None:
-        return arc.settings.get(MAX_UPLOAD_BYTES_KEY)
+    def max_upload_bytes(self) -> int:
+        """The biggest single file: `filer_max_upload_bytes` (default 1 GiB), never above what the database can
+        record for a size (`HARD_MAX_UPLOAD_BYTES`). Empty or 0 means that ceiling."""
+        value = arc.settings.get(MAX_UPLOAD_BYTES_KEY)
+        if not value or value <= 0:
+            return HARD_MAX_UPLOAD_BYTES
+        return min(int(value), HARD_MAX_UPLOAD_BYTES)
+
+    def scan_max_bytes(self) -> int:
+        """The biggest file that is sent to the scanner (0 = no cap). A bigger one is marked skipped."""
+        return max(0, int(arc.settings.get(SCAN_MAX_BYTES_KEY) or 0))
+
+    def scan_timeout_seconds(self) -> float:
+        return float(max(1, int(arc.settings.get(SCAN_TIMEOUT_SECONDS_KEY) or DEFAULT_SCAN_TIMEOUT_SECONDS)))
+
+    def upload_stale_minutes(self) -> int:
+        return max(1, int(arc.settings.get(UPLOAD_STALE_MINUTES_KEY) or DEFAULT_UPLOAD_STALE_MINUTES))
 
     def scan_enabled(self, *, private: bool) -> bool:
         key = SCAN_PRIVATE_KEY if private else SCAN_PUBLIC_KEY
@@ -194,6 +265,10 @@ class FilerProvider:
                 version = await asyncio.wait_for(_clamd_version(socket_path), timeout=2.0)
             except Exception:
                 version = None  # VERSION being unavailable/erroring never flips `connected`
+        backlog = await arc.relay.sql(
+            'SELECT count(*) AS pending, min(created_at) AS oldest FROM "filerfile" WHERE status = $1', "pending"
+        )
+        oldest = backlog[0]["oldest"] if backlog else None
         return {
             "engine": "ClamAV",
             "socket": socket_path,
@@ -202,6 +277,11 @@ class FilerProvider:
             "scan_public": self.scan_enabled(private=False),
             "scan_private": self.scan_enabled(private=True),
             "available_engines": ["ClamAV"],
+            # files uploaded and waiting for a verdict (not downloadable until they get one), and how long the
+            # oldest has waited: a growing number with `connected` false is a scanner that is down
+            "pending_scans": int(backlog[0]["pending"]) if backlog else 0,
+            "oldest_pending_seconds": int((arc.tz.utcnow() - oldest).total_seconds()) if oldest else None,
+            "max_scan_bytes": self.scan_max_bytes(),
         }
 
     def purge_after_days(self) -> int:
@@ -262,7 +342,35 @@ class FilerProvider:
     # ------------------------------------------------------------------ #
     # Upload — dedup (hardlink-or-copy, local only) + scan-verdict
     # inheritance; see docs §6 for the full status-inheritance table.
+    #
+    # Every upload goes through ONE pipeline (`_store`), whether its bytes are in memory (`upload`) or in a file
+    # on disk (`upload_file`, what a streamed request produces):
+    #   1. validate (storage, content type, size) and decide the key;
+    #   2. insert the row with status `uploading` - before any byte is stored, so a crash at any later point
+    #      leaves a row the janitor (tasks/uploads.py) can find, never an object nobody knows about;
+    #   3. place the bytes: hardlink a deduplicated copy (local), or save / save_file;
+    #   4. set the final status: `pending` (a scan will decide), `skipped` (scanning is off), or the verdict a
+    #      deduplicated copy inherits;
+    #   5. queue the scan job when the status is `pending`.
+    # A failure in 3 removes the row and the object again.
     # ------------------------------------------------------------------ #
+    def receive_upload(self, request: Any, *, field: str = "file") -> _uploads.ReceivedUpload:
+        """`async with arc.filer.receive_upload(request) as received:` - take the file of an upload request
+        into a private spool file while it arrives (see filer.uploads). `received.file` has the temporary
+        `path`, `size`, `sha256`, `filename` and `content_type`; hand them to `upload_file(..., move=True)`.
+        The content type is checked against `filer_allowed_content_types` as the part's headers arrive, and the
+        size limit as the bytes do, so a refused upload stops early. Works on a streaming route
+        (`stream_body=True`, the file never held in memory) and on an ordinary one (the body is already
+        in memory)."""
+        allowed = self.allowed_content_types()
+
+        def check_file(_name: str, _filename: str, content_type: str) -> None:
+            if allowed is not None and content_type not in allowed:
+                arc.relay.throw(f"content type '{content_type}' is not allowed", code="content_type_not_allowed")
+
+        settings = _uploads.UploadSettings.read(max_file_bytes=self.max_upload_bytes())
+        return _uploads.ReceivedUpload(request, settings, field=field, check_file=check_file)
+
     async def upload(
         self,
         content: bytes,
@@ -273,6 +381,65 @@ class FilerProvider:
         private: bool = True,
         path: str | None = None,
         by: str | None = None,
+    ) -> dict:
+        """Store `content` (already in memory). For a big file use `receive_upload` + `upload_file` instead."""
+        return await self._store(
+            _BytesSource(content),
+            filename=filename,
+            content_type=content_type,
+            size=len(content),
+            checksum=hashlib.sha256(content).hexdigest(),
+            storage=storage,
+            private=private,
+            path=path,
+            by=by,
+        )
+
+    async def upload_file(
+        self,
+        file_path: Any,
+        filename: str,
+        *,
+        content_type: str,
+        size: int | None = None,
+        checksum: str | None = None,
+        storage: str | None = None,
+        private: bool = True,
+        path: str | None = None,
+        by: str | None = None,
+        move: bool = False,
+    ) -> dict:
+        """Store the file at `file_path` without reading it into memory. `size` and `checksum` (the SHA-256 hex
+        digest) are what `receive_upload` already worked out while the file arrived; leave them out and they are
+        computed here. `move=True` hands the file over: local storage renames it into place (nothing is copied),
+        and it may no longer exist afterwards."""
+        file_path = Path(file_path)
+        if size is None or checksum is None:
+            size, checksum = await asyncio.to_thread(_measure, file_path)
+        return await self._store(
+            _FileSource(file_path, size, move),
+            filename=filename,
+            content_type=content_type,
+            size=size,
+            checksum=checksum,
+            storage=storage,
+            private=private,
+            path=path,
+            by=by,
+        )
+
+    async def _store(
+        self,
+        source: _BytesSource | _FileSource,
+        *,
+        filename: str,
+        content_type: str,
+        size: int,
+        checksum: str,
+        storage: str | None,
+        private: bool,
+        path: str | None,
+        by: str | None,
     ) -> dict:
         from filer.providers import PROVIDERS
 
@@ -286,31 +453,20 @@ class FilerProvider:
                 f"content type '{content_type}' is not allowed", code="content_type_not_allowed"
             )
         max_bytes = self.max_upload_bytes()
-        if max_bytes is not None and len(content) > max_bytes:
+        if size > max_bytes:
             arc.relay.throw(
                 f"file exceeds the {max_bytes}-byte upload limit", code="file_too_large"
             )
 
         normalized_path = _normalize_path(path)
-        checksum = hashlib.sha256(content).hexdigest()
         visibility_dir = "private" if private else "public"
         file_id = f"{'pri' if private else 'pub'}_{secrets.token_urlsafe(16)}"
         ext = _EXTENSION_FOR.get(content_type, ".bin")
         storage_key = f"{visibility_dir}/{normalized_path}/{file_id}{ext}"
+        scanning = self.scan_enabled(private=private)  # read once, here, on the event loop
 
         provider = PROVIDERS[storage]
-        status, linked = "pending", False
-        if storage == "local":
-            source = await self._dedup_source(checksum)
-            if source is not None:
-                try:
-                    await provider.link_or_copy(source["storage_key"], storage_key)
-                    linked = True
-                    status = self._inherit_status(source["status"], private=private)
-                except OSError:
-                    linked = False
-        if not linked:
-            await provider.save(storage_key, content, content_type=content_type)
+        dedup_source = await self._dedup_source(checksum) if storage == "local" else None
 
         row = await arc.relay.save(
             "filerfile",
@@ -318,26 +474,57 @@ class FilerProvider:
                 "file_id": file_id,
                 "storage": storage,
                 "storage_key": storage_key,
-                "original_filename": filename,
+                "original_filename": filename[:255],  # the column's length: a longer name must not fail the upload
                 "content_type": content_type,
-                "size_bytes": len(content),
+                "size_bytes": size,
                 "checksum": checksum,
                 "private": private,
                 "path": normalized_path,
-                "status": status,
+                "status": "uploading",
             },
             by=by,
         )
-        if status == "pending":
+        try:
+            final_status = None
+            if dedup_source is not None:
+                try:
+                    await provider.link_or_copy(dedup_source["storage_key"], storage_key)
+                    final_status = self._inherit_status(dedup_source["status"], private=private)
+                except OSError:
+                    final_status = None
+            if final_status is None:
+                await source.put(provider, storage_key, content_type)
+                final_status = "pending" if scanning else "skipped"
+            row = await arc.relay.save("filerfile", {"id": row["id"], "status": final_status}, by=by)
+        except BaseException:
+            # Shielded: a cancelled request (the client went away while the file was being stored) must still
+            # take back the row and whatever was stored.
+            await asyncio.shield(self._abandon_upload(provider, storage_key, row["id"]))
+            raise
+        if final_status == "pending":
             arc.relay.enqueue(_scan, row["id"])
         return row
+
+    async def _abandon_upload(self, provider: Any, storage_key: str, row_id: Any) -> None:
+        """Undo a failed upload: delete what was stored under `storage_key` and the `uploading` row. Each step
+        is attempted whatever the other does; what cannot be undone here is left for the janitor
+        (tasks/uploads.py: a row stuck in `uploading`), and logged."""
+        try:
+            await provider.delete(storage_key)
+        except Exception:  # noqa: BLE001 - best effort; the janitor repeats it
+            _logger.warning("could not remove %s after a failed upload", storage_key, exc_info=True)
+        try:
+            await arc.relay.sql('DELETE FROM "filerfile" WHERE id = $1 AND status = $2', row_id, "uploading")
+        except Exception:  # noqa: BLE001 - best effort; the janitor repeats it
+            _logger.warning("could not remove the upload record %s", row_id, exc_info=True)
 
     async def _dedup_source(self, checksum: str) -> dict | None:
         """Verdict priority: an infected row wins outright (a scanner-
         signature update can flip old verdicts, so infected-anywhere means
         infected-everywhere for these exact bytes), otherwise the most
         recently seen clean/skipped/pending row. 'deleted' rows are never
-        sources — the purge job could unlink one mid-race."""
+        sources — the purge job could unlink one mid-race. 'uploading' rows
+        are never sources either: their bytes may not be stored yet."""
         infected = await arc.relay.get(
             "filerfile",
             {"checksum": checksum, "storage": "local", "status": "infected"},
@@ -633,45 +820,81 @@ async def _mark_deleted(file_id: str) -> None:
         )
 
 
+async def _decide(row_id: Any, status: str) -> bool:
+    """Record a scan's outcome - but only on a file that is still `pending`. Scans overlap (the upload's own job
+    and a later rescan can both be running) and take a while: a file the user deleted meanwhile must stay
+    deleted, and a verdict already recorded must not be overwritten. True when this call decided it."""
+    if status == "deleted":
+        sql = 'UPDATE "filerfile" SET status = $1, deleted_at = $3 WHERE id = $2 AND status = $4 RETURNING id'
+        rows = await arc.relay.sql(sql, status, row_id, arc.tz.utcnow(), "pending")
+    else:
+        rows = await arc.relay.sql(
+            'UPDATE "filerfile" SET status = $1 WHERE id = $2 AND status = $3 RETURNING id', status, row_id, "pending"
+        )
+    return bool(rows)
+
+
 async def _scan(filerfile_id: str) -> None:
+    """The scan job for one file: stream it from storage to ClamAV and record the verdict.
+
+    A file is downloadable only once its status is `clean` or `skipped` (the serve endpoint says 404 to anything
+    else), so a file nobody has scanned is never served as clean:
+
+      * scanning has since been switched off for it -> `skipped`;
+      * it is over `filer_scan_max_bytes` (what clamd can take: its `StreamMaxLength`), or clamd itself says the
+        stream is too big -> `skipped` (it was NOT scanned, and is not called clean);
+      * clamd cannot be reached, or answers with an error -> the file stays `pending` and this job ends quietly:
+        `rescan_pending_files` (tasks/uploads.py) offers it again every few minutes until clamd is back, and the
+        admin's antivirus status shows the backlog;
+      * its bytes are missing from storage -> the record is marked `deleted`.
+    Already-decided files (a duplicate job, a rescan) are left alone."""
     from filer.providers import PROVIDERS
 
-    row = await arc.relay.get("filerfile", filerfile_id, ["id", "private", "storage", "storage_key"])
-    if row is None:
-        return
-    if not arc.filer.scan_enabled(private=row["private"]):
-        await arc.relay.save("filerfile", {"id": row["id"], "status": "skipped"})
-        return
-    content = await PROVIDERS[row["storage"]].read(row["storage_key"])
-    infected = await _clamd_scan(content)
-    await arc.relay.save(
-        "filerfile", {"id": row["id"], "status": "infected" if infected else "clean"}
+    row = await arc.relay.get(
+        "filerfile", filerfile_id, ["id", "file_id", "private", "storage", "storage_key", "size_bytes", "status"]
     )
+    if row is None or row["status"] != "pending":
+        return
+    filer = arc.filer
+    if not filer.scan_enabled(private=row["private"]):
+        await _decide(row["id"], "skipped")
+        return
+    cap = filer.scan_max_bytes()
+    if cap and row["size_bytes"] > cap:
+        _logger.info("%s is %d bytes, over the scan limit of %d: marked skipped, not scanned", row["file_id"], row["size_bytes"], cap)
+        await _decide(row["id"], "skipped")
+        return
+
+    socket_path, timeout = filer.clamav_socket(), filer.scan_timeout_seconds()  # settings: read on the loop
+    try:
+        result = await _clamd.scan_stream(socket_path, PROVIDERS[row["storage"]].read_stream(row["storage_key"]), timeout=timeout)
+    except FileNotFoundError:
+        _logger.warning("%s is missing from %s storage: its record is marked deleted", row["file_id"], row["storage"])
+        await _decide(row["id"], "deleted")
+        return
+    except _clamd.ClamdError as exc:
+        _logger.warning("scan of %s deferred, it stays pending: %s", row["file_id"], exc)
+        return
+    if result.verdict == "too_large":
+        _logger.info("clamd refused %s as over its stream limit: marked skipped, not scanned", row["file_id"])
+        await _decide(row["id"], "skipped")
+        return
+    await _decide(row["id"], "infected" if result.infected else "clean")
 
 
 async def _clamd_scan(content: bytes) -> bool:
-    """True if ClamAV's INSTREAM command flags `content` as infected.
-    Talks to a local clamd over its UNIX socket — the standard local-AV
-    integration point, kept behind this one thin function so a different
-    scanner could replace it later without touching the rest of filer."""
-    sock_path = arc.filer.clamav_socket()  # a setting: read here on the event loop, not in the thread below
+    """True if ClamAV's INSTREAM command flags `content` as infected (the whole of it in memory: kept for callers
+    that already hold bytes; `_scan` streams). Raises `filer.clamd.ClamdError` when clamd gives no verdict,
+    including when `content` is over its stream limit."""
 
-    def _do() -> bool:
-        import socket
-        import struct
+    async def pieces():
+        yield content
 
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.connect(sock_path)
-            sock.sendall(b"zINSTREAM\0")
-            chunk_size = 65536
-            for offset in range(0, len(content), chunk_size):
-                chunk = content[offset : offset + chunk_size]
-                sock.sendall(struct.pack("!L", len(chunk)) + chunk)
-            sock.sendall(struct.pack("!L", 0))
-            response = sock.recv(4096).decode("utf-8", errors="replace")
-        return "FOUND" in response
-
-    return await asyncio.to_thread(_do)
+    sock_path, timeout = arc.filer.clamav_socket(), arc.filer.scan_timeout_seconds()  # settings: on the loop
+    result = await _clamd.scan_stream(sock_path, pieces(), timeout=timeout)
+    if result.verdict == "too_large":
+        raise _clamd.ClamdError("the content is over clamd's stream limit: it was not scanned")
+    return result.infected
 
 
 async def _clamd_ping(socket_path: str) -> bool:
@@ -683,33 +906,15 @@ async def _clamd_ping(socket_path: str) -> bool:
     of this function mistook for "not connected" even though the daemon
     was up and scanning fine). PING has no such opt-out; it's always
     available whenever clamd is actually reachable."""
-
-    def _do() -> bool:
-        import socket
-
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.connect(socket_path)
-            sock.sendall(b"zPING\0")
-            return sock.recv(4096).strip(b"\x00") == b"PONG"
-
-    return await asyncio.to_thread(_do)
+    return await _clamd.command(socket_path, b"PING") == "PONG"
 
 
 async def _clamd_version(socket_path: str) -> str | None:
     """Best-effort only — VERSION is disabled in some clamd configs (see
     _clamd_ping's docstring); a refusal here must never be read as "not
     connected", only as "version unknown"."""
-
-    def _do() -> str | None:
-        import socket
-
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.connect(socket_path)
-            sock.sendall(b"zVERSION\0")
-            reply = sock.recv(4096).decode("utf-8", errors="replace").strip()
-            return None if "UNAVAILABLE" in reply.upper() else reply
-
-    return await asyncio.to_thread(_do)
+    reply = await _clamd.command(socket_path, b"VERSION")
+    return None if "UNAVAILABLE" in reply.upper() else reply
 
 
 def _ensure_scaffold(root: Path) -> None:
@@ -785,9 +990,10 @@ def register(kernel: Any) -> None:
         "`image/png,application/pdf`. If empty, any kind of file is allowed.",
     )
     kernel.settings.declare(
-        MAX_UPLOAD_BYTES_KEY, type=int, default=None,
-        doc="The biggest single file a user may upload, in bytes. If empty, there is no limit on file size (the "
-        "request limit above still applies)."
+        MAX_UPLOAD_BYTES_KEY, type=int, default=DEFAULT_MAX_UPLOAD_BYTES,
+        doc="The biggest single file a user may upload, in bytes (default 1 GiB, which is 1073741824). Bigger files "
+        "are refused. Empty or 0 means the most ARC can record for one file, about 2 GiB. The request limit "
+        "`filer_max_upload_request_bytes` must be a little above this, and it only changes after a restart."
     )
     kernel.settings.declare(
         SCAN_PUBLIC_KEY, type=bool, default=False,
@@ -864,9 +1070,20 @@ def register(kernel: Any) -> None:
         MAX_REQUEST_BODY_BYTES_KEY,
         type=int,
         default=DEFAULT_MAX_REQUEST_BODY_BYTES,
-        doc="The biggest upload request the server accepts for file uploads, in bytes (default 60 MB). It is the "
-        "outer limit, so keep it a little above the biggest file you allow. The limit for one file is "
-        "`filer_max_upload_bytes`.",
+        doc="The biggest request, in bytes (default 60 MB), for upload endpoints that read the whole request into memory "
+        "first, such as the employee documents and photo endpoints. It is deliberately small because the server holds "
+        "the request in memory. The main file upload (`/files/upload`) does not read it: see "
+        "`filer_max_upload_request_bytes`. Restart to apply.",
+    )
+    kernel.settings.declare(
+        MAX_UPLOAD_REQUEST_BYTES_KEY,
+        type=int,
+        default=DEFAULT_MAX_UPLOAD_REQUEST_BYTES,
+        doc="The biggest request the main file upload (`/files/upload`) accepts, in bytes (default 1 GiB plus 4 MiB). "
+        "That upload is written to disk as it arrives, so this can be large. It is the outer limit, so keep it a "
+        "little above the biggest file you allow (`filer_max_upload_bytes`), by a few megabytes for the form around "
+        "the file. Restart to apply; if you raise it, the web server in front (nginx) must be told too: run "
+        "`arc deploy prod`.",
     )
     kernel.settings.declare(
         STREAM_CHUNK_KB_KEY,
@@ -875,6 +1092,95 @@ def register(kernel: Any) -> None:
         doc="How many kilobytes of a file ARC reads at a time when it sends a download (default 256, kept between "
         "16 and 4096). Bigger chunks use less processor time when many downloads run at once; smaller ones hold "
         "less memory per download. Takes effect for the next download.",
+    )
+
+    kernel.settings.declare(
+        SCAN_MAX_BYTES_KEY,
+        type=int,
+        default=DEFAULT_SCAN_MAX_BYTES,
+        doc="The biggest file, in bytes, that is sent to the virus scanner (default 25 MiB, ClamAV's own limit; 0 "
+        "means no limit of ours). A bigger file is NOT scanned and is marked `skipped`, which makes it "
+        "downloadable. Keep it at or below `StreamMaxLength` in clamd.conf; if you raise that, raise this. Also "
+        "set `AlertExceedsMax yes` in clamd.conf so ClamAV never reports an unscanned file as clean.",
+    )
+    kernel.settings.declare(
+        SCAN_TIMEOUT_SECONDS_KEY,
+        type=int,
+        default=DEFAULT_SCAN_TIMEOUT_SECONDS,
+        doc="How many seconds ARC waits for ClamAV at each step of a scan (connecting, sending a piece of the "
+        "file, waiting for the verdict). Default 120. A file whose scan times out stays pending and is tried again.",
+    )
+    kernel.settings.declare(
+        UPLOAD_STALE_MINUTES_KEY,
+        type=int,
+        default=DEFAULT_UPLOAD_STALE_MINUTES,
+        doc="How many minutes an upload may stay marked `uploading` (its bytes are being stored) before the cleanup "
+        "treats it as abandoned by a crash and removes it. Default 60. Keep it well above the time storing your "
+        "biggest file takes.",
+    )
+    _uploads.declare_settings(kernel)
+    kernel.settings.declare(
+        "filer_s3_addressing_style", default="auto",
+        doc="How ARC builds S3 addresses: `auto` (let the library decide: the right choice for Amazon S3), `path` "
+        "(`https://host/bucket/key`: what MinIO and most self-hosted services need) or `virtual` "
+        "(`https://bucket.host/key`).",
+    )
+    kernel.settings.declare(
+        "filer_s3_checksum_mode", default="auto",
+        doc="Whether ARC adds extra integrity checksums to S3 requests. `auto` (default): yes for Amazon S3, no when "
+        "`filer_s3_endpoint_url` is set, because many S3-compatible services reject them. `when_supported` forces "
+        "them on, `when_required` forces them off.",
+    )
+    kernel.settings.declare(
+        "filer_s3_send_acl", type=bool, default=True,
+        doc="Whether ARC marks each S3 object private with an ACL header (default on). Turn it off for services that "
+        "refuse ACLs, such as Cloudflare R2 and Backblaze B2, and keep the bucket itself private.",
+    )
+    kernel.settings.declare(
+        "filer_s3_server_side_encryption", default="",
+        doc="Ask S3 to encrypt files at rest: empty (the bucket's own default), `AES256`, or `aws:kms`.",
+    )
+    kernel.settings.declare(
+        "filer_s3_sse_kms_key_id", default="",
+        doc="The KMS key to use when `filer_s3_server_side_encryption` is `aws:kms`. Empty uses the account's default "
+        "S3 key.",
+    )
+    kernel.settings.declare(
+        "filer_s3_part_size_mb", type=int, default=8,
+        doc="The size, in megabytes, of each part of a big S3 upload (default 8; kept between 5 and 512). A file "
+        "smaller than one part is sent in one request. Memory use is about this times "
+        "`filer_s3_upload_concurrency` per upload in progress.",
+    )
+    kernel.settings.declare(
+        "filer_s3_upload_concurrency", type=int, default=4,
+        doc="How many parts of one big S3 upload are sent at the same time (default 4, up to 32).",
+    )
+    kernel.settings.declare(
+        "filer_s3_redirect_over_mb", type=int, default=32,
+        doc="Downloads of files bigger than this many megabytes (default 32; 0 means never) are not sent through "
+        "ARC: the browser is sent to S3 with a link that works for 5 minutes, and downloads straight from there. "
+        "This keeps a big download from using memory on the server. Smaller files, and images and PDFs that are "
+        "shown inside a page, are still sent by ARC. For a service other than Amazon S3 this only happens when "
+        "`filer_s3_public_endpoint_url` is set.",
+    )
+    kernel.settings.declare(
+        "filer_s3_public_endpoint_url", default="",
+        doc="The address browsers use to reach your S3-compatible service, when it differs from "
+        "`filer_s3_endpoint_url` (which is what ARC itself uses, often an internal address such as "
+        "`http://minio:9000`). Needed for big downloads to be sent straight from the service; leave it empty for "
+        "Amazon S3 itself.",
+    )
+    kernel.settings.declare(
+        "filer_s3_connect_timeout_seconds", type=int, default=10,
+        doc="How many seconds ARC waits to connect to S3 (default 10).",
+    )
+    kernel.settings.declare(
+        "filer_s3_read_timeout_seconds", type=int, default=60,
+        doc="How many seconds ARC waits for S3 to answer or accept data (default 60).",
+    )
+    kernel.settings.declare(
+        "filer_s3_max_attempts", type=int, default=5,
+        doc="How many times ARC tries an S3 request that fails for a reason that may pass (default 5).",
     )
 
     pgdb = kernel.get("pgdb")
@@ -896,6 +1202,14 @@ def register(kernel: Any) -> None:
     _ensure_scaffold(Path(override) if override else find_project_root() / "files")
 
     provider = FilerProvider(kernel)
+    max_upload = kernel.settings.get(MAX_UPLOAD_BYTES_KEY)
+    request_limit = kernel.settings.get(MAX_UPLOAD_REQUEST_BYTES_KEY)
+    if max_upload and request_limit and request_limit < max_upload:
+        kernel.advise(
+            f"filer: {MAX_UPLOAD_REQUEST_BYTES_KEY} ({request_limit} bytes) is below {MAX_UPLOAD_BYTES_KEY} "
+            f"({max_upload} bytes), so an upload near the file limit is refused as too big as a request. Raise "
+            f"{MAX_UPLOAD_REQUEST_BYTES_KEY} to at least {max_upload + REQUEST_OVERHEAD_BYTES}."
+        )
     kernel.export(CAPABILITY, provider, requires=["pgdb", "relay"], optional_requires=["gateway"])
 
     # FILE/MULTIFILE discovery (docs §4) — sweep everything already

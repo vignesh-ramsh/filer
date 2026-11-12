@@ -23,7 +23,7 @@ from urllib.parse import quote
 
 import arc
 
-from filer import MAX_REQUEST_BODY_BYTES_KEY, DEFAULT_MAX_REQUEST_BODY_BYTES
+from filer import DEFAULT_MAX_UPLOAD_REQUEST_BYTES, MAX_UPLOAD_REQUEST_BYTES_KEY
 
 _INLINE_ALLOWLIST = frozenset(
     {"image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"}
@@ -60,9 +60,10 @@ def _content_disposition(filename: str) -> str:
 # settings.declare() calls have already run) — the route's own outer
 # ASGI body ceiling, deliberately separate from the live-editable,
 # per-file-content MAX_UPLOAD_BYTES_KEY checked inside arc.filer.upload()
-# itself. See filer/__init__.py's MAX_REQUEST_BODY_BYTES_KEY docstring.
-_raw_max_body = arc.settings.get(MAX_REQUEST_BODY_BYTES_KEY)
-_MAX_REQUEST_BODY_BYTES = int(_raw_max_body) if _raw_max_body else DEFAULT_MAX_REQUEST_BODY_BYTES
+# itself. See filer/__init__.py's MAX_UPLOAD_REQUEST_BYTES_KEY docstring (this route STREAMS its body to disk, so its
+# ceiling can be large; `filer_max_request_body_bytes` is the small one for bodies held in memory).
+_raw_max_body = arc.settings.get(MAX_UPLOAD_REQUEST_BYTES_KEY)
+_MAX_REQUEST_BODY_BYTES = int(_raw_max_body) if _raw_max_body else DEFAULT_MAX_UPLOAD_REQUEST_BYTES
 
 
 def _require_identity(identity):
@@ -86,7 +87,11 @@ def _as_bool(value: bool | str, *, default: bool) -> bool:
 
 
 @arc.relay.whitelist(
-    methods=["POST"], roles=["*"], path="/files/upload", max_body_bytes=_MAX_REQUEST_BODY_BYTES
+    methods=["POST"],
+    roles=["*"],
+    path="/files/upload",
+    max_body_bytes=_MAX_REQUEST_BODY_BYTES,
+    stream_body=True,
 )
 async def file_upload(
     request,
@@ -95,20 +100,33 @@ async def file_upload(
     path: str | None = None,
     identity=None,
 ) -> dict:
+    """Upload one file as multipart/form-data (the part is named `file`).
+
+    The request body is NOT read into memory: it is written to a private spool file as it arrives (hashing it on
+    the way), then stored (renamed into place for local storage, an S3 multipart upload for S3). The caller's roles
+    are checked before the first byte is read; the content type, the file size and the time the upload takes are
+    all checked while it streams, so a refused upload stops early.
+
+    Query parameters: `storage` (`local` or `s3`; default `filer_default_storage`), `private` (default true),
+    `path` (the folder to file it under). Returns `file_id`, `status`, `private` and `path`; the file is
+    downloadable once its status is `clean` or `skipped`."""
     identity = _require_identity(identity)
-    form = request.form()
-    upload = form.files.get("file")
-    if upload is None:
-        arc.relay.throw("no file part named 'file' in the multipart body", code="missing_file")
-    row = await arc.filer.upload(
-        upload.content,
-        upload.filename,
-        content_type=upload.content_type,
-        storage=storage,
-        private=_as_bool(private, default=True),
-        path=path,
-        by=identity.email,
-    )
+    async with arc.filer.receive_upload(request) as received:
+        upload = received.file
+        if upload is None:
+            arc.relay.throw("no file part named 'file' in the multipart body", code="missing_file")
+        row = await arc.filer.upload_file(
+            upload.path,
+            upload.filename,
+            content_type=upload.content_type,
+            size=upload.size,
+            checksum=upload.sha256,
+            storage=storage,
+            private=_as_bool(private, default=True),
+            path=path,
+            by=identity.email,
+            move=True,
+        )
     return {
         "file_id": row["file_id"],
         "status": row["status"],
@@ -121,7 +139,7 @@ async def file_upload(
 async def serve_file(file_id: str, exp: int | str | None = None, sig: str | None = None) -> Any:
     from filer.providers import PROVIDERS
     from filer.tokens import verify
-    from gateway.request import StreamResponse
+    from gateway.request import FileResponse, Response, StreamResponse
 
     row = await arc.relay.get("filerfile", {"file_id": file_id}, arc.relay.all_columns("filerfile"))
     if row is None or row["status"] not in ("clean", "skipped"):
@@ -169,6 +187,23 @@ async def serve_file(file_id: str, exp: int | str | None = None, sig: str | None
         # all, so it keeps the stricter DENY default — framing doesn't
         # matter for a download, and there's no reason to relax it there.
         headers["X-Frame-Options"] = "SAMEORIGIN"
+    if row["storage"] == "local":
+        # The SERVER sends the file (ASGI pathsend), at the pace the client reads it. Sending it as chunks from
+        # here does not slow down for a slow client: the server queues them all, so a 1 GiB download held about
+        # 1 GiB in the worker (docs/audit-logic-performance.md P3).
+        return FileResponse(
+            path=provider.path_of(row["storage_key"]), media_type=row["content_type"], headers=headers
+        )
+    if row["storage"] == "s3" and not inline:
+        # A big file to be DOWNLOADED goes straight from S3 to the browser: sent from here it would sit in the worker
+        # (granian queues every chunk whatever the client's pace). Not for inline types: an image or PDF shown in
+        # this app's own <img>/<iframe> must come from this origin (the CSP's default-src 'self' blocks a redirect
+        # to S3 there), so those keep streaming. See S3Provider.redirect_url for when the answer is None.
+        link = await provider.redirect_url(
+            row["storage_key"], row["size_bytes"], content_type=row["content_type"], content_disposition=disposition
+        )
+        if link is not None:
+            return Response(content=b"", status_code=302, headers={"Location": link}, media_type="text/plain")
     return StreamResponse(
         source=provider.read_stream(row["storage_key"]),
         media_type=row["content_type"],
