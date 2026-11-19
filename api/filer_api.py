@@ -111,6 +111,10 @@ async def file_upload(
     `path` (the folder to file it under). Returns `file_id`, `status`, `private` and `path`; the file is
     downloadable once its status is `clean` or `skipped`."""
     identity = _require_identity(identity)
+    private_bool = _as_bool(private, default=True)
+    # Refused before a byte of the body is read: with public uploads off, nobody should have to send up to a
+    # gigabyte to be told so. (`_store` checks again where the row is written.)
+    arc.filer.require_visibility_allowed(private=private_bool)
     async with arc.filer.receive_upload(request) as received:
         upload = received.file
         if upload is None:
@@ -122,7 +126,7 @@ async def file_upload(
             size=upload.size,
             checksum=upload.sha256,
             storage=storage,
-            private=_as_bool(private, default=True),
+            private=private_bool,
             path=path,
             by=identity.email,
             move=True,

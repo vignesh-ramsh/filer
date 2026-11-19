@@ -39,6 +39,7 @@ from arc import permissions
 from relay.resolvers import FieldResolver
 
 from . import clamd as _clamd
+from . import sniff as _sniff
 from . import uploads as _uploads
 
 CAPABILITY = "filer"
@@ -49,6 +50,8 @@ ALLOWED_CONTENT_TYPES_KEY = "filer_allowed_content_types"
 MAX_UPLOAD_BYTES_KEY = "filer_max_upload_bytes"
 SCAN_PUBLIC_KEY = "filer_scan_public"
 SCAN_PRIVATE_KEY = "filer_scan_private"
+ALLOW_PUBLIC_UPLOADS_KEY = "filer_allow_public_uploads"
+VERIFY_CONTENT_TYPE_KEY = "filer_verify_content_type"
 CLAMAV_SOCKET_KEY = "filer_clamav_socket"
 PURGE_AFTER_DAYS_KEY = "filer_purge_after_days"
 ORPHAN_GRACE_HOURS_KEY = "filer_orphan_grace_hours"
@@ -180,6 +183,10 @@ class _BytesSource:
 
     content: bytes
 
+    def head(self, count: int) -> bytes:
+        """The first `count` bytes."""
+        return self.content[:count]
+
     async def put(self, provider: Any, key: str, content_type: str) -> None:
         await provider.save(key, self.content, content_type=content_type)
 
@@ -191,6 +198,11 @@ class _FileSource:
     path: Path
     size: int
     move: bool
+
+    def head(self, count: int) -> bytes:
+        """The first `count` bytes. Blocking (a file read): run it in a thread."""
+        with open(self.path, "rb") as handle:
+            return handle.read(count)
 
     async def put(self, provider: Any, key: str, content_type: str) -> None:
         await provider.save_file(key, self.path, size=self.size, content_type=content_type, move=self.move)
@@ -240,6 +252,25 @@ class FilerProvider:
     def scan_enabled(self, *, private: bool) -> bool:
         key = SCAN_PRIVATE_KEY if private else SCAN_PUBLIC_KEY
         return arc.settings.get(key)
+
+    def verify_content_type(self) -> bool:
+        """Is an upload's content checked against the type it declares (`filer_verify_content_type`, on by default)?"""
+        return bool(arc.settings.get(VERIFY_CONTENT_TYPE_KEY))
+
+    def allow_public_uploads(self) -> bool:
+        """Is anybody allowed to upload a file as public? (`filer_allow_public_uploads`, on by default.)"""
+        return bool(arc.settings.get(ALLOW_PUBLIC_UPLOADS_KEY))
+
+    def require_visibility_allowed(self, *, private: bool) -> None:
+        """Refuses (403, `public_upload_disabled`) a PUBLIC file while `filer_allow_public_uploads` is off. A private
+        one always passes. Called before a byte of an upload is read (the upload endpoint) and again where the row is
+        written (`_store`, which every way of storing a file goes through), so no path can skip it."""
+        if not private and not self.allow_public_uploads():
+            arc.relay.throw(
+                "public uploads are turned off on this server: every file must be private",
+                status=403,
+                code="public_upload_disabled",
+            )
 
     def clamav_socket(self) -> str:
         return arc.settings.get(CLAMAV_SOCKET_KEY)
@@ -447,11 +478,16 @@ class FilerProvider:
         if storage not in PROVIDERS:
             arc.relay.throw(f"unknown storage provider '{storage}'", code="unknown_storage")
 
+        self.require_visibility_allowed(private=private)  # the one place every way of storing a file passes
         allowed = self.allowed_content_types()
         if allowed is not None and content_type not in allowed:
             arc.relay.throw(
                 f"content type '{content_type}' is not allowed", code="content_type_not_allowed"
             )
+        if self.verify_content_type():  # the setting is read here, on the event loop; the file read is not
+            problem = _sniff.mismatch(content_type, await asyncio.to_thread(source.head, _sniff.HEAD_BYTES))
+            if problem:
+                arc.relay.throw(problem, code="content_type_mismatch")
         max_bytes = self.max_upload_bytes()
         if size > max_bytes:
             arc.relay.throw(
@@ -1004,6 +1040,24 @@ def register(kernel: Any) -> None:
         SCAN_PRIVATE_KEY, type=bool, default=False,
         doc="Scan private uploads for viruses with ClamAV before keeping them. ClamAV must be installed and "
         "`filer_clamav_socket` must point at it. Off by default."
+    )
+    kernel.settings.declare(
+        ALLOW_PUBLIC_UPLOADS_KEY, type=bool, default=True,
+        doc="Whether anyone may upload a file as public. A public file can be opened by anybody who has its link, "
+        "without signing in, from this site's own address. When this is off, every upload is private (reachable "
+        "only through a short-lived signed link) and an upload that asks for public is refused with the error "
+        "`public_upload_disabled`, whoever is asking; a file cannot be switched to public either. Files that are "
+        "already public stay public and keep working. On by default.",
+    )
+    kernel.settings.declare(
+        VERIFY_CONTENT_TYPE_KEY, type=bool, default=True,
+        doc="Check that an uploaded file really is the kind of file it says it is, by looking at its first bytes. "
+        "The type an upload names (`image/png`, `application/pdf`, ...) is only what the sender wrote: with this on, a "
+        "file declared as a picture, a PDF, a ZIP or an Office document must start the way that format starts, and a "
+        "program (Windows, Linux or macOS executable) may not be sent as anything but a program or a plain binary. "
+        "Types that cannot be told from their first bytes (text, CSV, JSON, SVG, old Office files) are not checked. "
+        "A file that fails is refused with `content_type_mismatch`. On by default; turn it off only if honest "
+        "uploads are being refused.",
     )
     kernel.settings.declare(
         CLAMAV_SOCKET_KEY, default=DEFAULT_CLAMAV_SOCKET,
