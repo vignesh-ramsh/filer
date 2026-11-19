@@ -39,6 +39,7 @@ from arc import permissions
 from relay.resolvers import FieldResolver
 
 from . import clamd as _clamd
+from . import content_types as _content_types
 from . import sniff as _sniff
 from . import uploads as _uploads
 
@@ -225,11 +226,17 @@ class FilerProvider:
     def default_storage(self) -> str:
         return arc.settings.get(DEFAULT_STORAGE_KEY)
 
-    def allowed_content_types(self) -> set[str] | None:
-        raw = arc.settings.get(ALLOWED_CONTENT_TYPES_KEY)
-        if not raw:
-            return None
-        return {t.strip() for t in raw.split(",") if t.strip()}
+    def allowed_content_types(self) -> frozenset[str]:
+        """The content types an upload may declare (`filer_allowed_content_types`): the default list until it is set,
+        exactly the list once it is, and an EMPTY set when it was emptied - then nothing is allowed. Never "any"."""
+        return _content_types.parse(arc.settings.get(ALLOWED_CONTENT_TYPES_KEY))
+
+    def require_uploads_possible(self) -> None:
+        """Refuses (400, `content_type_not_allowed`) at once when `filer_allowed_content_types` has been emptied,
+        because then no file can pass: the upload endpoint calls it before reading a byte, so nobody sends a file
+        to be told so."""
+        if not self.allowed_content_types():
+            arc.relay.throw(_content_types.problem("", frozenset()), code="content_type_not_allowed")
 
     def max_upload_bytes(self) -> int:
         """The biggest single file: `filer_max_upload_bytes` (default 1 GiB), never above what the database can
@@ -393,11 +400,12 @@ class FilerProvider:
         size limit as the bytes do, so a refused upload stops early. Works on a streaming route
         (`stream_body=True`, the file never held in memory) and on an ordinary one (the body is already
         in memory)."""
-        allowed = self.allowed_content_types()
+        allowed = self.allowed_content_types()  # read here, on the event loop, not inside the callback
 
         def check_file(_name: str, _filename: str, content_type: str) -> None:
-            if allowed is not None and content_type not in allowed:
-                arc.relay.throw(f"content type '{content_type}' is not allowed", code="content_type_not_allowed")
+            problem = _content_types.problem(content_type, allowed)
+            if problem:
+                arc.relay.throw(problem, code="content_type_not_allowed")
 
         settings = _uploads.UploadSettings.read(max_file_bytes=self.max_upload_bytes())
         return _uploads.ReceivedUpload(request, settings, field=field, check_file=check_file)
@@ -479,11 +487,9 @@ class FilerProvider:
             arc.relay.throw(f"unknown storage provider '{storage}'", code="unknown_storage")
 
         self.require_visibility_allowed(private=private)  # the one place every way of storing a file passes
-        allowed = self.allowed_content_types()
-        if allowed is not None and content_type not in allowed:
-            arc.relay.throw(
-                f"content type '{content_type}' is not allowed", code="content_type_not_allowed"
-            )
+        problem = _content_types.problem(content_type, self.allowed_content_types())
+        if problem:
+            arc.relay.throw(problem, code="content_type_not_allowed")
         if self.verify_content_type():  # the setting is read here, on the event loop; the file read is not
             problem = _sniff.mismatch(content_type, await asyncio.to_thread(source.head, _sniff.HEAD_BYTES))
             if problem:
@@ -1007,7 +1013,7 @@ def register(kernel: Any) -> None:
     # naming the setting, instead of surfacing wherever the purge task
     # first runs. allowed_content_types stays untyped: it's a
     # comma-separated SET, and declare()'s `type` only covers
-    # int/float/bool/str, no collection support.
+    # int/float/bool/str, no collection support (filer/content_types.py parses it).
     kernel.settings.declare(
         LOCAL_ROOT_KEY,
         doc="The folder on this server where uploaded files are kept when storage is `local`. If empty, ARC uses a "
@@ -1022,8 +1028,15 @@ def register(kernel: Any) -> None:
     )
     kernel.settings.declare(
         ALLOWED_CONTENT_TYPES_KEY,
-        doc="Which kinds of file may be uploaded, as a comma-separated list of file types (MIME types) such as "
-        "`image/png,application/pdf`. If empty, any kind of file is allowed.",
+        default=_content_types.DEFAULT_ALLOWED_CONTENT_TYPES,
+        doc="The only kinds of file that may be uploaded, as a comma-separated list of file types (MIME types) such "
+        "as `image/png,application/pdf`. Exact types only: there are no wildcards, so `image/*` allows nothing. Until "
+        "you change it, it is the usual pictures, documents, spreadsheets, presentations, text and CSV files and zip "
+        "archives, and nothing that can be run or opened as a web page (no scripts, HTML, SVG or programs, and not the "
+        "catch-all `application/octet-stream`). Your list replaces it. A file of any other type is refused with "
+        "`content_type_not_allowed`. If you EMPTY the list, no file is allowed at all: every upload is refused as an "
+        "unallowed file type. It applies to every upload, including the files ARC makes itself, such as data exports "
+        "(`text/csv`, and the Excel type).",
     )
     kernel.settings.declare(
         MAX_UPLOAD_BYTES_KEY, type=int, default=DEFAULT_MAX_UPLOAD_BYTES,
