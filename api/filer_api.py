@@ -17,13 +17,42 @@ that already passed its own role gate).
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 from urllib.parse import quote
 
-import arc
+from botocore.exceptions import BotoCoreError, ClientError
 
+import arc
 from filer import DEFAULT_MAX_UPLOAD_REQUEST_BYTES, MAX_UPLOAD_REQUEST_BYTES_KEY
+
+_logger = logging.getLogger("arc.filer")
+
+
+class _DownloadStream:
+    """Keep one prefetched chunk and explicitly close the upstream on disconnect.
+
+    A wrapper async generator cannot close an already-open upstream if sending
+    headers fails before the wrapper's first iteration. This iterator can.
+    """
+
+    def __init__(self, source, first: bytes | None):
+        self.source = source
+        self.first = first
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.first is not None:
+            first, self.first = self.first, None
+            return first
+        return await anext(self.source)
+
+    async def aclose(self):
+        self.first = None
+        await self.source.aclose()
 
 _INLINE_ALLOWLIST = frozenset(
     {"image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"}
@@ -209,8 +238,27 @@ async def serve_file(file_id: str, exp: int | str | None = None, sig: str | None
         )
         if link is not None:
             return Response(content=b"", status_code=302, headers={"Location": link}, media_type="text/plain")
+    # Open S3 and read one bounded chunk BEFORE committing the HTTP status.
+    # Merely constructing read_stream() does no I/O: it is an async generator.
+    source = provider.read_stream(row["storage_key"])
+    try:
+        first = await anext(source, None)
+    except FileNotFoundError:
+        await source.aclose()
+        arc.relay.throw("not found", status=404, code="not_found")
+    except (BotoCoreError, ClientError, OSError):
+        await source.aclose()
+        _logger.warning("storage read failed for file %s", file_id, exc_info=True)
+        return Response(
+            content={"error": "file storage temporarily unavailable", "code": "storage_unavailable"},
+            status_code=503,
+            headers={"Retry-After": "30", "Cache-Control": "no-store"},
+        )
+    except BaseException:
+        await source.aclose()
+        raise
     return StreamResponse(
-        source=provider.read_stream(row["storage_key"]),
+        source=_DownloadStream(source, first),
         media_type=row["content_type"],
         headers=headers,
     )

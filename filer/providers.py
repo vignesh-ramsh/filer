@@ -332,7 +332,8 @@ def _botocore_config(values: S3Settings) -> Any:
 
 
 def _is_missing_object(exc: Exception) -> bool:
-    code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
+    response = getattr(exc, "response", None) or {}
+    code = str(response.get("Error", {}).get("Code", ""))
     return code in ("NoSuchKey", "404", "NotFound")
 
 
