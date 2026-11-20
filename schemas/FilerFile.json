@@ -11,7 +11,9 @@
     {"id": "AA07", "name": "checksum", "type": "STRING", "length": 64, "required": true},
     {"id": "AA08", "name": "private", "type": "BOOLEAN", "required": true, "default": true},
     {"id": "AA09", "name": "status", "type": "SELECT", "required": true, "default": "pending", "options": ["uploading", "pending", "clean", "infected", "skipped", "deleted"]},
-    {"id": "AA10", "name": "deleted_at", "type": "DATETIME"}
+    {"id": "AA10", "name": "deleted_at", "type": "DATETIME"},
+    {"id": "AB01", "name": "path", "type": "STRING", "length": 255, "required": true, "default": "ungrouped"}
   ],
-  "index": [{"key": "idx_filerfile_checksum", "fields": ["checksum"]}, {"key": "idx_filerfile_status", "fields": ["status"]}]
+  "index": [{"key": "idx_filerfile_checksum", "fields": ["checksum"]}, {"key": "idx_filerfile_status", "fields": ["status"]},
+            {"key": "idx_filerfile_path", "fields": ["path"]}]
 }
